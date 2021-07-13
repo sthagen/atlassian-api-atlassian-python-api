@@ -735,7 +735,7 @@ class Jira(AtlassianRestAPI):
         :param list issue_list:
         :return:
         """
-        jira_issue_regex = re.compile(r"[A-Z]{1,10}-\d+")
+        jira_issue_regex = re.compile(r"\w+-\d+")
         missing_issues = list()
         matched_issue_keys = list()
         for key in issue_list:
@@ -3844,7 +3844,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         if 400 <= response.status_code < 600:
             try:
                 j = response.json()
-                error_msg = "\n".join(j["errorMessages"])
+                error_msg = "\n".join(j["errorMessages"] + [k + ": " + v for k, v in j["errors"].items()])
             except Exception:
                 response.raise_for_status()
 
