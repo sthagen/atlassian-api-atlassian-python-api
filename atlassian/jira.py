@@ -805,22 +805,15 @@ class Jira(AtlassianRestAPI):
 
         return self.get(url)
 
-    def issue_archive(self, issue_id_or_key, notify_users=False):
+    def issue_archive(self, issue_id_or_key):
         """
         Archives an issue.
         :param issue_id_or_key: Issue id or issue key
-        :param notify_users: send the email with notification that the issue was updated to users that watch it.
-                            Admin or project admin permissions are required to disable the notification.
         :return:
         """
-        params = {}
-        if notify_users:
-            params["notifyUsers"] = "true"
-        else:
-            params["notifyUsers"] = "false"
         base_url = self.resource_url("issue")
         url = "{base_url}/{issueIdOrKey}/archive".format(base_url=base_url, issueIdOrKey=issue_id_or_key)
-        return self.get(url)
+        return self.put(url)
 
     def issue_field_value(self, key, field):
         base_url = self.resource_url("issue")
@@ -962,6 +955,30 @@ class Jira(AtlassianRestAPI):
             "{base_url}/{issue_key}/watchers".format(base_url=base_url, issue_key=issue_key),
             data=data,
         )
+
+    def issue_delete_watcher(self, issue_key, user):
+        """
+        Stop watching issue
+        :param issue_key:
+        :param user:
+        :return:
+        """
+        log.warning('Deleting user {user} from "{issue_key}" watchers'.format(issue_key=issue_key, user=user))
+        params = {"username": user}
+        base_url = self.resource_url("issue")
+        return self.delete(
+            "{base_url}/{issue_key}/watchers".format(base_url=base_url, issue_key=issue_key),
+            params=params,
+        )
+
+    def issue_get_watchers(self, issue_key):
+        """
+        Get watchers for an issue
+        :param issue_key: Issue Id or Key
+        :return: List of watchers for issue
+        """
+        base_url = self.resource_url("issue")
+        return self.get("{base_url}/{issue_key}/watchers".format(base_url=base_url, issue_key=issue_key))
 
     def assign_issue(self, issue, account_id=None):
         """Assign an issue to a user. None will set it to unassigned. -1 will set it to Automatic.
@@ -1785,6 +1802,36 @@ class Jira(AtlassianRestAPI):
         """
         payload = {"moveFixIssuesTo": moved_fixed, "moveAffectedIssuesTo": move_affected}
         return self.delete("rest/api/2/version/{}".format(version), data=payload)
+
+    def update_version(
+        self,
+        version,
+        name=None,
+        description=None,
+        is_archived=None,
+        is_released=None,
+        start_date=None,
+        release_date=None,
+    ):
+        """
+        Update a project version
+        :param version: The version id to update
+        :param name: The version name
+        :param description: The version description
+        :param is_archived:
+        :param is_released:
+        :param startDate: The Start Date in isoformat. Example value is "2015-04-11T15:22:00.000+10:00"
+        :param releaseDate: The Release Date in isoformat. Example value is "2015-04-11T15:22:00.000+10:00"
+        """
+        payload = {
+            "name": name,
+            "description": description,
+            "archived": is_archived,
+            "released": is_released,
+            "startDate": start_date,
+            "releaseDate": release_date,
+        }
+        return self.put("rest/api/3/version/{}".format(version), data=payload)
 
     def get_project_roles(self, project_key):
         """
@@ -3867,5 +3914,5 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
                 error_msg = "\n".join(j["errorMessages"] + [k + ": " + v for k, v in j["errors"].items()])
             except Exception:
                 response.raise_for_status()
-
-            raise HTTPError(error_msg, response=response)
+            else:
+                raise HTTPError(error_msg, response=response)
