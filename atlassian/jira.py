@@ -590,6 +590,22 @@ class Jira(AtlassianRestAPI):
         url = "{base_url}/{id}".format(base_url=base_url, id=filter_id)
         return self.get(url)
 
+    def update_filter(self, filter_id, jql, **kwargs):
+        """
+        :param filter_id: int
+        :param jql: str
+        :param kwargs: dict, Optional (name, description, favourite)
+        :return:
+        """
+        allowed_fields = ("name", "description", "favourite")
+        data = {"jql": jql}
+        for k, v in kwargs.items():
+            if k in allowed_fields:
+                data.update({k: v})
+        base_url = self.resource_url("filter")
+        url = "{base_url}/{id}".format(base_url=base_url, id=filter_id)
+        return self.put(url, data=data)
+
     def delete_filter(self, filter_id):
         """
         Deletes a filter that has the given id.
@@ -2569,6 +2585,7 @@ class Jira(AtlassianRestAPI):
                 fixed system limits. Default by built-in method: 50
         :param expand: OPTIONAL: expand the search result
         :param validate_query: Whether to validate the JQL query
+        :param advanced_mode: Make an advanced mode
         :return:
         """
         params = {}
@@ -3680,7 +3697,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
     #   Agile(Formerly Greenhopper) REST API implements
     #   Resource: https://docs.atlassian.com/jira-software/REST/7.3.1/
     #######################################################################
-    def add_issues_to_backlog(self, sprint_id, issues):
+    def add_issues_to_backlog(self, issues):
         """
         Adding Issue(s) to Backlog
         :param issues:       list:  List of Issue Keys
