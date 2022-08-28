@@ -1,6 +1,7 @@
 # coding=utf-8
 import logging
 import re
+from warnings import warn
 
 from requests import HTTPError
 
@@ -917,11 +918,30 @@ class Jira(AtlassianRestAPI):
         return query_result, missing_issues
 
     def issue_createmeta(self, project, expand="projects.issuetypes.fields"):
+        """
+        This function is deprecated.
+        See https://confluence.atlassian.com/jiracore/createmeta-rest-endpoint-to-be-removed-975040986.html
+        for further details.
+        """
+        warn(
+            "This function will fail from Jira 9+. "
+            "Use issue_createmeta_issuetypes or issue_createmeta_fieldtypes instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         params = {}
         if expand:
             params["expand"] = expand
-        url = "rest/api/2/issue/createmeta?projectKeys={}".format(project)
+        url = self.resource_url("issue/createmeta?projectKeys={}".format(project))
         return self.get(url, params=params)
+
+    def issue_createmeta_issuetypes(self, project):
+        url = self.resource_url("issue/createmeta/{}/issuetypes".format(project))
+        return self.get(url)
+
+    def issue_createmeta_fieldtypes(self, project, issue_type_id):
+        url = self.resource_url("issue/createmeta/{}/issuetypes/{}".format(project, issue_type_id))
+        return self.get(url)
 
     def issue_editmeta(self, key):
         base_url = self.resource_url("issue")
@@ -1301,7 +1321,9 @@ class Jira(AtlassianRestAPI):
             url += "/" + internal_id
         return self.get(url, params=params)
 
-    def create_or_update_issue_remote_links(self, issue_key, link_url, title, global_id=None, relationship=None):
+    def create_or_update_issue_remote_links(
+        self, issue_key, link_url, title, global_id=None, relationship=None, icon_url=None, icon_title=None
+    ):
         """
         Add Remote Link to Issue, update url if global_id is passed
         :param issue_key: str
@@ -1309,6 +1331,8 @@ class Jira(AtlassianRestAPI):
         :param title: str
         :param global_id: str, OPTIONAL:
         :param relationship: str, OPTIONAL: Default by built-in method: 'Web Link'
+        :param icon_url: str, OPTIONAL: Link to a 16x16 icon representing the type of the object in the remote system
+        :param icon_title: str, OPTIONAL: Text for the tooltip of the main icon describing the type of the object in the remote system
         """
         base_url = self.resource_url("issue")
         url = "{base_url}/{issue_key}/remotelink".format(base_url=base_url, issue_key=issue_key)
@@ -1317,6 +1341,13 @@ class Jira(AtlassianRestAPI):
             data["globalId"] = global_id
         if relationship:
             data["relationship"] = relationship
+        if icon_url or icon_title:
+            icon_data = {}
+            if icon_url:
+                icon_data["url16x16"] = icon_url
+            if icon_title:
+                icon_data["title"] = icon_title
+            data["icon"] = icon_data
         return self.post(url, data=data)
 
     def get_issue_remote_link_by_id(self, issue_key, link_id):
@@ -1820,6 +1851,17 @@ class Jira(AtlassianRestAPI):
     Projects
     Reference: https://docs.atlassian.com/software/jira/docs/api/REST/8.5.0/#api/2/project
     """
+
+    def get_user_groups(self, account_id=None):
+        """
+        Get groups of a user
+        This API is only available for Jira Cloud platform
+        :param account_id: str
+        :return: list of group info
+        """
+        params = {"accountId": account_id}
+        url = self.resource_url("user/groups")
+        return self.get(url, params=params)
 
     def get_all_projects(self, included_archived=None, expand=None):
         return self.projects(included_archived, expand)
