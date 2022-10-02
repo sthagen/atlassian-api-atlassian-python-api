@@ -8,6 +8,7 @@ log = logging.getLogger(__name__)
 
 
 class Insight(AtlassianRestAPI):
+
     """Insight for Jira API wrapper."""
 
     # https://insight-javadoc.riada.io/insight-javadoc-8.6/insight-rest/
@@ -155,6 +156,7 @@ class Insight(AtlassianRestAPI):
     def get_comment_of_object(self, object_id):
         """
         The object id to fetch comments from
+
         :param object_id:
         :return:
         """
@@ -184,6 +186,7 @@ class Insight(AtlassianRestAPI):
     def get_all_global_icons(self):
         """
         All existing global icons
+
         :return:
         """
         url = self.url_joiner(self.api_root, "icon/global")
@@ -206,6 +209,7 @@ class Insight(AtlassianRestAPI):
     def reindex_insight(self):
         """
         Should the reindex clean the index before doing the reindex
+
         :return:
         """
         if self.cloud:
@@ -216,6 +220,7 @@ class Insight(AtlassianRestAPI):
     def reindex_current_node_insight(self):
         """
         Should the reindex clean the index before doing the reindex
+
         :return:
         """
         if self.cloud:
@@ -332,7 +337,7 @@ class Insight(AtlassianRestAPI):
         params = {"asc": asc, "abbreviate": abbreviate}
         url = self.url_joiner(self.api_root, "object/{id}/history".format(id=object_id))
         return self.get(url, params=params)
-
+        
     @deprecated(version="3.29.0", reason="Use get_object_reference_info()")
     def get_object_referenceinfo(self, object_id):
         """Let's use the get_object_reference_info()"""
@@ -422,11 +427,14 @@ class Insight(AtlassianRestAPI):
         url = self.url_joiner(self.api_root, "objectconnectedtickets/{id}/tickets".format(id=object_id))
         return self.get(url)
 
-    # Objectschema
+    # Object schema
+    @deprecated(version="3.29.1", reason="Use list_object_schema()")
     def list_objectschema(self):
+        return self.list_object_schema()
+
+    def list_object_schema(self):
         """
         Resource to find object schemas in Insight
-
         :return:
         {
             "objectschemas": [
@@ -446,43 +454,43 @@ class Insight(AtlassianRestAPI):
         url = self.url_joiner(self.api_root, "objectschema/list")
         return self.get(url)
 
-    def create_objectschema(self, object_schema_key, description):
+    def create_object_schema(self, object_schema_key, description):
         raise NotImplementedError
 
+    @deprecated(version="3.29.1", reason="Use get_objectschema()")
     def get_objectschema(self, schema_id):
+        return self.get_objectschema(schema_id=schema_id)
+
+    def get_object_schema(self, schema_id):
         """
         Find a schema by id
-
         :param schema_id:
         """
         url = self.url_joiner(self.api_root, "objectschema/{id}".format(id=schema_id))
         return self.get(url)
 
-    def update_objectschema(self, schema_id):
+    def update_object_schema(self, schema_id):
         """
         Update an object schema
-
         """
         raise NotImplementedError
 
-    def delete_objectschema(self, schema_id):
+    def delete_object_schema(self, schema_id):
         """
         Delete a schema
 
         """
         raise NotImplementedError
 
-    def get_objectschema_attributes(self, schema_id):
+    def get_object_schema_attributes(self, schema_id):
         """
         Find all object type attributes for this object schema
-
         """
         raise NotImplementedError
 
-    def get_objectschema_objecttypes_flat(self, schema_id):
+    def get_object_schema_object_types_flat(self, schema_id):
         """
         Find all object types for this object schema
-
         """
         raise NotImplementedError
 

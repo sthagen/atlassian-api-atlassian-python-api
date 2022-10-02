@@ -11,6 +11,7 @@ from .portfolio import Portfolio
 from .service_desk import ServiceDesk
 from .xray import Xray
 
+
 __all__ = [
     "Confluence",
     "Jira",
