@@ -1357,7 +1357,7 @@ class Confluence(AtlassianRestAPI):
         :param version_number:
         :return:
         """
-        url = "rest/experimental/content/{0}/version/{1}".format(content_id, version_number)
+        url = "rest/api/content/{id}/version/{versionNumber}".format(id=content_id, versionNumber=version_number)
         return self.get(url)
 
     def remove_content_history(self, page_id, version_number):
@@ -1511,7 +1511,7 @@ class Confluence(AtlassianRestAPI):
         :return:
         """
         # update current page
-        params = {'status': 'current'}
+        params = {"status": "current"}
         log.info('Updating {type} "{title}" with {parent_id}'.format(title=title, type=type, parent_id=parent_id))
 
         if not always_update and body is not None and self.is_page_content_is_already_updated(page_id, body, title):
@@ -2785,7 +2785,8 @@ class Confluence(AtlassianRestAPI):
             try:
                 j = response.json()
                 error_msg = j["message"]
-            except Exception:
+            except Exception as e:
+                log.error(e)
                 response.raise_for_status()
             else:
                 raise HTTPError(error_msg, response=response)
