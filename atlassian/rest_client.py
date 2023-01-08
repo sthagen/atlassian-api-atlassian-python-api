@@ -173,7 +173,7 @@ class AtlassianRestAPI(object):
             api_root = self.api_root
         if api_version is None:
             api_version = self.api_version
-        return "/".join(s.strip("/") for s in [api_root, api_version, resource] if s is not None)
+        return "/".join(str(s).strip("/") for s in [api_root, api_version, resource] if s is not None)
 
     @staticmethod
     def url_joiner(url, path, trailing=None):
@@ -433,7 +433,7 @@ class AtlassianRestAPI(object):
                     error_msg = "\n".join([k + ": " + v for k, v in j.items()])
                 else:
                     error_msg = "\n".join(
-                        j.get("errorMessages", list()) + [k + ": " + v for k, v in j.get("errors", dict()).items()]
+                        j.get("errorMessages", list()) + [k.get("message", "") for k in j.get("errors", dict())]
                     )
             except Exception as e:
                 log.error(e)

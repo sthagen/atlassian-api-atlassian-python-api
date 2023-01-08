@@ -492,7 +492,7 @@ class Confluence(AtlassianRestAPI):
 
         return response.get("results")
 
-    def get_all_pages_from_space(
+    def get_all_pages_from_space_raw(
         self,
         space,
         start=0,
@@ -543,7 +543,36 @@ class Confluence(AtlassianRestAPI):
 
             raise
 
-        return response.get("results")
+        return response
+
+    def get_all_pages_from_space(
+        self,
+        space,
+        start=0,
+        limit=50,
+        status=None,
+        expand=None,
+        content_type="page",
+    ):
+        """
+        Get all pages from space
+
+        :param space:
+        :param start: OPTIONAL: The start point of the collection to return. Default: None (0).
+        :param limit: OPTIONAL: The limit of the number of pages to return, this may be restricted by
+                            fixed system limits. Default: 50
+        :param status: OPTIONAL: list of statuses the content to be found is in.
+                                 Defaults to current is not specified.
+                                 If set to 'any', content in 'current' and 'trashed' status will be fetched.
+                                 Does not support 'historical' status for now.
+        :param expand: OPTIONAL: a comma separated list of properties to expand on the content.
+                                 Default value: history,space,version.
+        :param content_type: the content type to return. Default value: page. Valid values: page, blogpost.
+        :return:
+        """
+        return self.get_all_pages_from_space_raw(
+            space=space, start=start, limit=limit, status=status, expand=expand, content_type=content_type
+        ).get("results")
 
     def get_all_pages_from_space_trash(self, space, start=0, limit=500, status="trashed", content_type="page"):
         """
@@ -1421,7 +1450,12 @@ class Confluence(AtlassianRestAPI):
         :param version_number:
         :return:
         """
-        url = "rest/api/content/{id}/version/{versionNumber}".format(id=content_id, versionNumber=version_number)
+        if self.cloud:
+            url = "rest/api/content/{id}/version/{versionNumber}".format(id=content_id, versionNumber=version_number)
+        else:
+            url = "rest/experimental/content/{id}/version/{versionNumber}".format(
+                id=content_id, versionNumber=version_number
+            )
         return self.get(url)
 
     def remove_content_history(self, page_id, version_number):
@@ -1431,7 +1465,12 @@ class Confluence(AtlassianRestAPI):
         :param version_number: version number
         :return:
         """
-        url = "rest/api/content/{id}/version/{versionNumber}".format(id=page_id, versionNumber=version_number)
+        if self.cloud:
+            url = "rest/api/content/{id}/version/{versionNumber}".format(id=page_id, versionNumber=version_number)
+        else:
+            url = "rest/experimental/content/{id}/version/{versionNumber}".format(
+                id=page_id, versionNumber=version_number
+            )
         self.delete(url)
 
     def remove_page_history(self, page_id, version_number):
@@ -1596,6 +1635,7 @@ class Confluence(AtlassianRestAPI):
             "type": type,
             "title": title,
             "version": {"number": version, "minorEdit": minor_edit},
+            "metadata": {"properties": {}},
         }
         if body is not None:
             data["body"] = self._create_body(body, representation)

@@ -583,6 +583,42 @@ class Jira(AtlassianRestAPI):
             data["description"] = description
         return self.post(url, data=data)
 
+    def get_custom_field_option_context(self, field_id, context_id):
+        """
+        Gets the current values of a custom field
+        :param field_id:
+        :param context_id:
+        :return:
+
+        Reference: https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-issue-custom-field-options/#api-rest-api-2-field-fieldid-context-contextid-option-get
+        """
+        url = self.resource_url(
+            "field/{field_id}/context/{context_id}/option".format(field_id=field_id, context_id=context_id),
+            api_version=2,
+        )
+        return self.get(url)
+
+    def add_custom_field_option(self, field_id, context_id, options):
+        """
+         Adds the values given to the custom field
+         Administrator permission required
+         :param field_id:
+         :param context_id:
+         :param options: List of values to be added
+         :return:
+
+        Reference: https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-issue-custom-field-options/#api-rest-api-2-field-fieldid-context-contextid-option-post
+        """
+        data = {"options": []}
+        for i in options:
+            data["options"].append({"disabled": "false", "value": i})
+
+        url = self.resource_url(
+            "field/{field_id}/context/{context_id}/option".format(field_id=field_id, context_id=context_id),
+            api_version=2,
+        )
+        return self.post(url, data=data)
+
     """
     Dashboards
     Reference: https://docs.atlassian.com/software/jira/docs/api/REST/8.5.0/#api/2/dashboard
@@ -1872,9 +1908,26 @@ class Jira(AtlassianRestAPI):
 
     def invalidate_websudo(self):
         """
-        This method invalidates the any current WebSudo session.
+        This method invalidates any current WebSudo session.
         """
         return self.delete("rest/auth/1/websudo")
+
+    def users_get_all(
+        self,
+        start=0,
+        limit=50,
+    ):
+        """
+        :param start:
+        :param limit:
+        :return:
+        """
+        url = self.resource_url("users/search")
+        params = {
+            "startAt": start,
+            "maxResults": limit,
+        }
+        return self.get(url, params=params)
 
     def user_find_by_user_string(
         self,
@@ -1909,8 +1962,8 @@ class Jira(AtlassianRestAPI):
         """
         url = self.resource_url("user/search")
         params = {
-            "includeActive": include_active_users,
-            "includeInactive": include_inactive_users,
+            "includeActive": str(include_active_users).lower(),
+            "includeInactive": str(include_inactive_users).lower(),
             "startAt": start,
             "maxResults": limit,
         }
@@ -4221,7 +4274,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         """
         :param board_id: int, str
         """
-        url = "rest/agile/1.0/{board_id}/backlog".format(board_id=board_id)
+        url = "rest/agile/1.0/board/{board_id}/backlog".format(board_id=board_id)
         return self.get(url)
 
     def get_issues_for_board(self, board_id, jql, fields="*all", start=0, limit=None, expand=None):
