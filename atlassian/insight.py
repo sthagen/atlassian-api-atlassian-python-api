@@ -47,9 +47,11 @@ class Insight(AtlassianRestAPI):
         return args, kwargs
 
     def __get_workspace_id(self):
-        return self.get("rest/servicedeskapi/insight/workspace", headers=self.default_headers,)["values"][
-            0
-        ]["workspaceId"]
+        result = self.get(
+            "rest/servicedeskapi/insight/workspace",
+            headers=self.default_headers,
+        )
+        return result["values"][0]["workspaceId"]
 
     def _get_insight_workspace_ids(self):
         """
@@ -563,7 +565,7 @@ class Insight(AtlassianRestAPI):
         params.update({k: v for k, v in kwargs if v is not None and k not in ["self", "type_id"]})
 
         return self.get(
-            "{0}objecttype/{1}/attributes".format(self.api_root, type_id),
+            "{0}/objecttype/{1}/attributes".format(self.api_root, type_id),
             headers=self.experimental_headers,
             params=params,
         )

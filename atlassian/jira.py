@@ -2114,7 +2114,22 @@ class Jira(AtlassianRestAPI):
         url = "{base_url}/{key}".format(base_url=base_url, key=key)
         return self.delete(url)
 
+    def archive_project(self, key):
+        """
+        Archives a project.
+        :param key:
+        """
+        base_url = self.resource_url("project")
+        url = "{base_url}/{key}/archive".format(base_url=base_url, key=key)
+        return self.put(url)
+
     def project(self, key, expand=None):
+        """
+        Get project with details
+        :param key:
+        :param expand:
+        :return:
+        """
         params = {}
         if expand:
             params["expand"] = expand

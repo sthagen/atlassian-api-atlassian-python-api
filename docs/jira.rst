@@ -90,8 +90,17 @@ Manage projects
     # Returns all projects which are visible for the currently logged in user.
     jira.get_all_projects(included_archived=None)
 
+    # Delete project
+    jira.delete_project(key)
+
+    # Archive Project
+    jira.archive_project(key)
+
     # Get project
-    jira.project(key)
+    jira.project(key, expand=None)
+
+    # Get project info
+    jira.get_project(key, expand=None)
 
     # Get project components using project key
     jira.get_project_components(key)
