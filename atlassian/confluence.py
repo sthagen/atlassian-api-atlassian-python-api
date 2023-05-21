@@ -5,6 +5,7 @@ import time
 import json
 
 from requests import HTTPError
+import requests
 from deprecated import deprecated
 from atlassian import utils
 from .errors import ApiError, ApiNotFoundError, ApiPermissionError, ApiValueError, ApiConflictError, ApiNotAcceptable
@@ -327,7 +328,7 @@ class Confluence(AtlassianRestAPI):
         :param version: (int)
         :param expand: OPTIONAL: Default value: history,space,version
                        We can also specify some extensions such as extensions.inlineProperties
-                       (for getting inline comment-specific properties) or extensions.resolution
+                       (for getting inline comment-specific properties) or extensions. Resolution
                        for the resolution status of each comment in the results
         :return:
         """
@@ -915,7 +916,7 @@ class Confluence(AtlassianRestAPI):
     @deprecated(version="3.7.0", reason="Use get_blueprint_templates()")
     def get_all_blueprints_from_space(self, space, start=0, limit=None, expand=None):
         """
-        Get all users blue prints from space. Experimental API
+        Get all users blueprints from space. Experimental API
         :param space: Space Key
         :param start: OPTIONAL: The start point of the collection to return. Default: None (0).
         :param limit: OPTIONAL: The limit of the number of pages to return, this may be restricted by
@@ -2285,7 +2286,7 @@ class Confluence(AtlassianRestAPI):
     def get_user_details_by_username(self, username, expand=None):
         """
         Get information about a user through username
-        :param username: The user name
+        :param username: The username
         :param expand: OPTIONAL expand for get status of user.
                 Possible param is "status". Results are "Active, Deactivated"
         :return: Returns the user details
@@ -2433,7 +2434,11 @@ class Confluence(AtlassianRestAPI):
         url = "spaces/flyingpdf/pdfpageexport.action?pageId={pageId}".format(pageId=page_id)
         if self.api_version == "cloud":
             url = self.get_pdf_download_url_for_confluence_cloud(url)
-
+            if not url:
+                log.error("Failed to get download PDF url.")
+                raise ApiNotFoundError("Failed to export page as PDF", reason="Failed to get download PDF url.")
+            # To download the PDF file, the request should be with no headers of authentications.
+            return requests.get(url, timeout=75).content
         return self.get(url, headers=headers, not_json_response=True)
 
     def get_page_as_word(self, page_id):
@@ -2532,7 +2537,7 @@ class Confluence(AtlassianRestAPI):
 
     def anonymous(self):
         """
-        Get information about the how anonymous is represented in confluence
+        Get information about how anonymous is represented in confluence
         :return:
         """
         try:
@@ -2662,51 +2667,50 @@ class Confluence(AtlassianRestAPI):
     def get_pdf_download_url_for_confluence_cloud(self, url):
         """
         Confluence cloud does not return the PDF document when the PDF
-        export is initiated. Instead it starts a process in the background
+        export is initiated. Instead, it starts a process in the background
         and provides a link to download the PDF once the process completes.
-        This functions polls the long running task page and returns the
+        This functions polls the long-running task page and returns the
         download url of the PDF.
         :param url: URL to initiate PDF export
         :return: Download url for PDF file
         """
-        download_url = None
         try:
-            long_running_task = True
+            running_task = True
             headers = self.form_token_headers
             log.info("Initiate PDF export from Confluence Cloud")
             response = self.get(url, headers=headers, not_json_response=True)
             response_string = response.decode(encoding="utf-8", errors="strict")
             task_id = response_string.split('name="ajs-taskId" content="')[1].split('">')[0]
-            poll_url = "runningtaskxml.action?taskId={0}".format(task_id)
-            while long_running_task:
-                long_running_task_response = self.get(poll_url, headers=headers, not_json_response=True)
-                long_running_task_response_parts = long_running_task_response.decode(
-                    encoding="utf-8", errors="strict"
-                ).split("\n")
-                percentage_complete = long_running_task_response_parts[6].strip()
-                is_successful = long_running_task_response_parts[7].strip()
-                is_complete = long_running_task_response_parts[8].strip()
-                log.info("Sleep for 5s.")
-                time.sleep(5)
+            poll_url = "/services/api/v1/task/{0}/progress".format(task_id)
+            while running_task:
                 log.info("Check if export task has completed.")
-                if is_complete == "<isComplete>true</isComplete>":
-                    if is_successful == "<isSuccessful>true</isSuccessful>":
-                        log.info(percentage_complete)
-                        log.info("Downloading content...")
-                        log.debug("Extract taskId and download PDF.")
-                        current_status = long_running_task_response_parts[3]
-                        download_url = current_status.split("href=&quot;/wiki/")[1].split("&quot")[0]
-                        long_running_task = False
-                    elif is_successful == "<isSuccessful>false</isSuccessful>":
+                progress_response = self.get(poll_url)
+                percentage_complete = int(progress_response.get("progress", 0))
+                task_state = progress_response.get("state")
+                if percentage_complete == 100:
+                    running_task = False
+                    log.info("Task completed - {task_state}".format(task_state=task_state))
+                    if task_state == "FAILED":
                         log.error("PDF conversion not successful.")
                         return None
+                    log.debug("Extract task results to download PDF.")
+                    task_result_url = progress_response.get("result")
                 else:
-                    log.info(percentage_complete)
+                    log.info(
+                        "{percentage_complete}% - {task_state}".format(
+                            percentage_complete=percentage_complete, task_state=task_state
+                        )
+                    )
+                    time.sleep(3)
+            log.debug("Task successfully done, querying the task result for the download url")
+            # task result url starts with /wiki, remove it.
+            task_content = self.get(task_result_url[5:], not_json_response=True)
+            download_url = task_content.decode(encoding="utf-8", errors="strict")
+            log.debug("Successfully got the download url")
+            return download_url
         except IndexError as e:
             log.error(e)
             return None
-
-        return download_url
 
     def audit(
         self,
@@ -2891,7 +2895,7 @@ class Confluence(AtlassianRestAPI):
 
     def get_subtree_of_content_ids(self, page_id):
         """
-        Get sub tree of page ids
+        Get subtree of page ids
         :param page_id:
         :return: Set of page ID
         """
