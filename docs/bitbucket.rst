@@ -369,7 +369,19 @@ Bitbucket Cloud
     deployment_environment = repository.deployment_environments.get(deployment_environment_key)
 
     # Get a list of deployment environment variables from a deployment environment
-    deployment_environment.deployment_environment_variables.each():
+    deployment_environment_variables = deployment_environment.deployment_environment_variables.each():
+
+    # Create a new deployment environment variable with a name of 'KEY', value of 'VALUE' and is not secured.
+    new_deployment_environment_variable = deployment_environment.deployment_environment_variables.create("KEY", "VALUE", False)
+
+    # Update the 'key' field of repository_variable
+    updated_deployment_environment_variable = new_deployment_environment_variable.update(key="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_KEY")
+
+    # Update the 'value' field of repository_variable
+    updated_deployment_environment_variable = new_deployment_environment_variable.update(value="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_VALUE")
+
+    # Delete deployment environment variable
+    updated_deployment_environment_variable.delete()
 
     # Get a list of group permissions from a repository
     repository.group_permissions.each():
@@ -381,7 +393,19 @@ Bitbucket Cloud
     repository.repository_variables.each():
 
     # Get a single repository variable from a repository by repository variable key
-    repository.repository_variables.get(repository_variable_key)
+    repository_variable = repository.repository_variables.get(repository_variable_key)
+
+    # Create a new repository variable with a name of 'KEY', value of 'VALUE' and is not secured.
+    new_repository_variable = repository.repository_variables.create("KEY", "VALUE", False)
+
+    # Update the 'key' field of repository_variable
+    updated_repository_variable = repository_variable.update(key="UPDATED_REPOSITORY_VARIABLE_KEY")
+
+    # Update the 'value' field of repository_variable
+    updated_repository_variable = repository_variable.update(value="UPDATED_REPOSITORY_VARIABLE_VALUE")
+
+    # Delete repository_variable
+    repository_variable.delete()
 
 Pipelines management
 --------------------
