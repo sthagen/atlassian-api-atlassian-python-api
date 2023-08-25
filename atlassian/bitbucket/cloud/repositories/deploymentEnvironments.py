@@ -170,8 +170,7 @@ class DeploymentEnvironmentVariables(BitbucketCloudBase):
 
         API docs: https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pipelines/#api-repositories-workspace-repo-slug-deployments-config-environments-environment-uuid-variables-get
         """
-        params = {}
-        params["pagelen"] = pagelen
+        params = {"pagelen": pagelen}
 
         response = super(BitbucketCloudBase, self).get(None, params=params)
 
@@ -190,7 +189,7 @@ class DeploymentEnvironmentVariables(BitbucketCloudBase):
 
             if pagelen_total < size_total:
                 pagelen_total = pagelen_total + response["pagelen"]
-                page = page + 1
+                page += 1
                 response = super(BitbucketCloudBase, self).get(None, params={"pagelen": pagelen, "page": page})
             else:
                 break
@@ -224,9 +223,7 @@ class DeploymentEnvironmentVariable(BitbucketCloudBase):
     def delete(self):
         """
         Delete the repository variable.
-
         :return: The response on success
-
         API docs: https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pipelines/#api-repositories-workspace-repo-slug-deployments-config-environments-environment-uuid-variables-variable-uuid-delete
         """
         return super(DeploymentEnvironmentVariable, self).delete("/{}".format(self.uuid))

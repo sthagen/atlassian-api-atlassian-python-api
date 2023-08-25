@@ -2,7 +2,7 @@
 import logging
 import re
 from warnings import warn
-
+from deprecated import deprecated
 from requests import HTTPError
 
 from .errors import ApiNotFoundError, ApiPermissionError
@@ -128,7 +128,7 @@ class Jira(AtlassianRestAPI):
 
     def get_advanced_settings(self):
         """
-        Returns the properties that are displayed on the "General Configuration > Advanced Settings" page
+        Returns the properties that are displayed on the "General Configuration > Advanced Settings" page.
         :return:
         """
         url = self.resource_url("application-properties/advanced-settings")
@@ -1077,15 +1077,22 @@ class Jira(AtlassianRestAPI):
         url = "{}/{}/editmeta".format(base_url, key)
         return self.get(url)
 
-    def get_issue_changelog(self, issue_key):
+    def get_issue_changelog(self, issue_key, start=None, limit=None):
         """
         Get issue related change log
         :param issue_key:
+        :param start: start index, usually 0
+        :param limit: limit of the results, usually 50
         :return:
         """
         base_url = self.resource_url("issue")
         url = "{base_url}/{issue_key}?expand=changelog".format(base_url=base_url, issue_key=issue_key)
-        return (self.get(url) or {}).get("changelog")
+        params = {}
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return (self.get(url) or {}).get("changelog", params)
 
     def issue_add_json_worklog(self, key, worklog):
         """
@@ -1508,6 +1515,7 @@ class Jira(AtlassianRestAPI):
         relationship=None,
         icon_url=None,
         icon_title=None,
+        status_resolved=False,
     ):
         """
         Add Remote Link to Issue, update url if global_id is passed
@@ -1518,10 +1526,11 @@ class Jira(AtlassianRestAPI):
         :param relationship: str, OPTIONAL: Default by built-in method: 'Web Link'
         :param icon_url: str, OPTIONAL: Link to a 16x16 icon representing the type of the object in the remote system
         :param icon_title: str, OPTIONAL: Text for the tooltip of the main icon describing the type of the object in the remote system
+        :param status_resolved: bool, OPTIONAL: if set to True, Jira renders the link strikethrough
         """
         base_url = self.resource_url("issue")
         url = "{base_url}/{issue_key}/remotelink".format(base_url=base_url, issue_key=issue_key)
-        data = {"object": {"url": link_url, "title": title}}
+        data = {"object": {"url": link_url, "title": title, "status": {"resolved": status_resolved}}}
         if global_id:
             data["globalId"] = global_id
         if relationship:
@@ -1532,7 +1541,7 @@ class Jira(AtlassianRestAPI):
                 icon_data["url16x16"] = icon_url
             if icon_title:
                 icon_data["title"] = icon_title
-            data["icon"] = icon_data
+            data["object"]["icon"] = icon_data
         return self.post(url, data=data)
 
     def get_issue_remote_link_by_id(self, issue_key, link_id):
@@ -4227,9 +4236,18 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return self.get("rest/tempo-teams/2/user/{}/memberships".format(username))
 
     #######################################################################
-    #   Agile(Formerly Greenhopper) REST API implements
+    #   Agile (Formerly Greenhopper) REST API implements
     #   Resource: https://docs.atlassian.com/jira-software/REST/7.3.1/
     #######################################################################
+    # /rest/agile/1.0/backlog/issue
+    def move_issues_to_backlog(self, issue_keys):
+        """
+        Move issues to backlog
+        :param issue_keys: list of issues
+        :return:
+        """
+        return self.add_issues_to_backlog(issues=issue_keys)
+
     def add_issues_to_backlog(self, issues):
         """
         Adding Issue(s) to Backlog
@@ -4243,6 +4261,29 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
             raise ValueError("`issues` param should be List of Issue Keys")
         url = "/rest/agile/1.0/backlog/issue"
         data = dict(issues=issues)
+        return self.post(url, data=data)
+
+    def get_agile_board_by_filter_id(self, filter_id):
+        """
+        Gets an agile board by the filter id
+        :param filter_id: int, str
+        """
+        url = "rest/agile/1.0/board/filter/{filter_id}".format(filter_id=filter_id)
+        return self.get(url)
+
+    # /rest/agile/1.0/board
+    def create_agile_board(self, name, type, filter_id, location=None):
+        """
+        Create an agile board
+        :param name: str: Must be less than 255 characters.
+        :param type: str: "scrum" or "kanban"
+        :param filter_id: int
+        :param location: dict, Optional. Only specify this for Jira Cloud!
+        """
+        data = {"name": name, "type": type, "filterId": filter_id}
+        if location:
+            data["location"] = location
+        url = "rest/agile/1.0/board"
         return self.post(url, data=data)
 
     def get_all_agile_boards(
@@ -4277,6 +4318,15 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
 
         return self.get(url, params=params)
 
+    def delete_agile_board(self, board_id):
+        """
+        Delete agile board by id
+        :param board_id:
+        :return:
+        """
+        url = "rest/agile/1.0/board/{}".format(str(board_id))
+        return self.delete(url)
+
     def get_agile_board(self, board_id):
         """
         Get agile board info by id
@@ -4286,26 +4336,17 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         url = "rest/agile/1.0/board/{}".format(str(board_id))
         return self.get(url)
 
-    def create_agile_board(self, name, type, filter_id, location=None):
+    def get_issues_for_backlog(self, board_id):
         """
-        Create an agile board
-        :param name: str
-        :param type: str, scrum or kanban
-        :param filter_id: int
-        :param location: dict, Optional. Only specify this for Jira Cloud!
+        Returns all issues from the board's backlog, for the given board ID.
+        This only includes issues that the user has permission to view.
+        The backlog contains incomplete issues that are not assigned to any future or active sprint.
+        Note, if the user does not have permission to view the board, no issues will be returned at all.
+        Issues returned from this resource include Agile fields, like sprint, closedSprints, flagged, and epic.
+        By default, the returned issues are ordered by rank.
+        :param board_id: int, str
         """
-        data = {"name": name, "type": type, "filterId": filter_id}
-        if location:
-            data["location"] = location
-        url = "rest/agile/1.0/board"
-        return self.post(url, data=data)
-
-    def get_agile_board_by_filter_id(self, filter_id):
-        """
-        Gets an agile board by the filter id
-        :param filter_id: int, str
-        """
-        url = "rest/agile/1.0/board/filter/{filter_id}".format(filter_id=filter_id)
+        url = "rest/agile/1.0/board/{board_id}/backlog".format(board_id=board_id)
         return self.get(url)
 
     def get_agile_board_configuration(self, board_id):
@@ -4335,16 +4376,13 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         url = "rest/agile/1.0/board/{}/configuration".format(str(board_id))
         return self.get(url)
 
-    def get_issues_for_backlog(self, board_id):
-        """
-        :param board_id: int, str
-        """
-        url = "rest/agile/1.0/board/{board_id}/backlog".format(board_id=board_id)
-        return self.get(url)
-
     def get_issues_for_board(self, board_id, jql, fields="*all", start=0, limit=None, expand=None):
         """
-        Get issues for board
+        Returns all issues from a board, for a given board Id.
+        This only includes issues that the user has permission to view.
+        Note, if the user does not have permission to view the board,
+        no issues will be returned at all. Issues returned from this resource include Agile fields,
+        like sprint, closedSprints, flagged, and epic. By default, the returned issues are ordered by rank.
         :param board_id: int, str
         :param jql:
         :param fields: list of fields, for example: ['priority', 'summary', 'customfield_10007']
@@ -4371,22 +4409,339 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         url = "rest/agile/1.0/board/{board_id}/issue".format(board_id=board_id)
         return self.get(url, params=params)
 
-    def delete_agile_board(self, board_id):
+    # /rest/agile/1.0/board/{boardId}/epic
+    def get_epics(
+        self,
+        board_id,
+        done=False,
+        start=0,
+        limit=50,
+    ):
         """
-        Delete agile board by id
+        Returns all epics from the board, for the given board Id.
+        This only includes epics that the user has permission to view.
+        Note, if the user does not have permission to view the board, no epics will be returned at all.
+        :param board_id:
+        :param done:  Filter results to epics that are either done or not done. Valid values: true, false.
+        :param start: The starting index of the returned epics. Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of epics to return per page. Default: 50.
+                      See the 'Pagination' section at the top of this page for more details.
+        :return:
+        """
+        url = "rest/agile/1.0/board/{board_id}/epic".format(board_id=board_id)
+        params = {}
+        if done:
+            params["done"] = done
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return self.get(url, params=params)
+
+    def get_issues_for_epic(
+        self, board_id, epic_id, jql="", validate_query="", fields="*all", expand="", start=0, limit=50
+    ):
+        """
+        Returns all issues that belong to an epic on the board, for the given epic Id and the board Id.
+        This only includes issues that the user has permission to view.
+        Issues returned from this resource include Agile fields, like sprint, closedSprints, flagged, and epic.
+        By default, the returned issues are ordered by rank.
+        :param epic_id:
+        :param board_id:
+        :param jql:   Filter results using a JQL query.
+                      If you define an order in your JQL query,
+                      it will override the default order of the returned issues.
+        :param validate_query: Specifies whether to validate the JQL query or not. Default: true.
+        :param fields: The list of fields to return for each issue.
+                       By default, all navigable and Agile fields are returned.
+        :param expand: A comma-separated list of the parameters to expand.
+        :param start: The starting index of the returned issues.
+                      Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of issues to return per page.
+                      Default: 50.
+                      See the 'Pagination' section at the top of this page for more details.
+                      Note, the total number of issues returned is limited
+                      by the property 'jira.search.views.default.max' in your JIRA instance.
+                      If you exceed this limit, your results will be truncated.
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/epic/{epicId}/issue".format(epicId=epic_id, boardId=board_id)
+        params = {}
+        if jql:
+            params["jql"] = jql
+        if validate_query:
+            params["validateQuery"] = validate_query
+        if fields:
+            params["fields"] = fields
+        if expand:
+            params["expand"] = expand
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return self.get(url, params=params)
+
+    def get_issues_without_epic(
+        self,
+        board_id,
+        jql="",
+        validate_query="",
+        fields="*all",
+        expand="",
+        start=0,
+        limit=50,
+    ):
+        """
+        Returns all issues that do not belong to any epic on a board, for a given board Id.
+        This only includes issues that the user has permission to view.
+        Issues returned from this resource include Agile fields, like sprint, closedSprints, flagged, and epic.
+        By default, the returned issues are ordered by rank.
+        :param board_id:
+        :param jql:     Filter results using a JQL query.
+                        If you define an order in your JQL query,
+                        it will override the default order of the returned issues.
+        :param validate_query:  Specifies whether to validate the JQL query or not. Default: true.
+        :param fields:  The list of fields to return for each issue.
+                        By default, all navigable and Agile fields are returned.
+        :param expand:  A comma-separated list of the parameters to expand.
+        :param start:   The starting index of the returned issues.
+                        Base index: 0.
+                        See the 'Pagination' section at the top of this page for more details.
+        :param limit:   The maximum number of issues to return per page. Default: 50.
+                        See the 'Pagination' section at the top of this page for more details.
+                        Note, the total number of issues returned is limited by
+                        the property 'jira.search.views.default.max' in your JIRA instance.
+                        If you exceed this limit, your results will be truncated.
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/epic/none/issue".format(boardId=board_id)
+        params = {}
+        if jql:
+            params["jql"] = jql
+        if validate_query:
+            params["validateQuery"] = validate_query
+        if fields:
+            params["fields"] = fields
+        if expand:
+            params["expand"] = expand
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return self.get(url, params=params)
+
+    # rest/agile/1.0/board/{boardId}/project
+    def get_all_projects_associated_with_board(self, board_id, start=0, limit=50):
+        """
+        Returns all projects that are associated with the board,
+        for the given board ID. A project is associated with a board only
+        if the board filter explicitly filters issues by the project and guaranties that
+        all issues will come for one of those projects e.g. board's filter with
+        "project in (PR-1, PR-1) OR reporter = admin" jql Projects are returned only
+        if user can browse all projects that are associated with the board.
+        Note, if the user does not have permission to view the board,
+        no projects will be returned at all. Returned projects are ordered by the name.
+        :param board_id:
+        :param start: The starting index of the returned projects.
+                      Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of projects to return per page.
+                      Default: 50.
+                      See the 'Pagination' section at the top of this page for more details
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/project".format(boardId=board_id)
+        params = {}
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return self.get(url, params=params)
+
+    # /rest/agile/1.0/board/{boardId}/properties
+    def get_agile_board_properties(self, board_id):
+        """
+        Returns the keys of all properties for the board identified by the id.
+        The user who retrieves the property keys is required to have permissions to view the board.
+        :param board_id: int, str
+        """
+        url = "rest/agile/1.0/board/{boardId}/properties".format(boardId=board_id)
+        return self.get(url)
+
+    def set_agile_board_property(self, board_id, property_key):
+        """
+        Sets the value of the specified board's property.
+        You can use this resource to store a custom data
+        against the board identified by the id.
+        The user who stores the data is required to have permissions to modify the board.
+        :param board_id:
+        :param property_key:
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/properties/{propertyKey}".format(
+            boardId=board_id, propertyKey=property_key
+        )
+        return self.put(url)
+
+    def get_agile_board_property(self, board_id, property_key):
+        """
+        Returns the value of the property with a given key from the board identified by the provided id.
+        The user who retrieves the property is required to have permissions to view the board.
+        :param board_id:
+        :param property_key:
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/properties/{propertyKey}".format(
+            boardId=board_id, propertyKey=property_key
+        )
+        return self.get(url)
+
+    def delete_agile_board_property(self, board_id, property_key):
+        """
+        Removes the property from the board identified by the id.
+        Ths user removing the property is required to have permissions to modify the board.
+        :param board_id:
+        :param property_key:
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/properties/{propertyKey}".format(
+            boardId=board_id, propertyKey=property_key
+        )
+        return self.delete(url)
+
+    # /rest/agile/1.0/board/{boardId}/settings/refined-velocity
+    def get_agile_board_refined_velocity(self, board_id):
+        """
+        Returns the estimation statistic settings of the board.
         :param board_id:
         :return:
         """
-        url = "rest/agile/1.0/board/{}".format(str(board_id))
-        return self.delete(url)
-
-    def get_agile_board_properties(self, board_id):
-        """
-        Gets a list of all the board properties
-        :param board_id: int, str
-        """
-        url = "rest/agile/1.0/board/{board_id}/properties".format(board_id=board_id)
+        url = "/rest/agile/1.0/board/{boardId}/settings/refined-velocity".format(boardId=board_id)
         return self.get(url)
+
+    def set_agile_board_refined_velocity(self, board_id, data):
+        """
+        Sets the estimation statistic settings of the board.
+        :param board_id:
+        :param data:
+        :return:
+        """
+        url = "/rest/agile/1.0/board/{boardId}/settings/refined-velocity".format(boardId=board_id)
+        return self.put(url, data=data)
+
+    # /rest/agile/1.0/board/{boardId}/sprint
+
+    def get_all_sprints_from_board(self, board_id, state=None, start=0, limit=50):
+        """
+        Returns all sprints from a board, for a given board ID.
+        This only includes sprints that the user has permission to view.
+        :param board_id:
+        :param state: Filter results to sprints in specified states.
+                      Valid values: future, active, closed.
+                      You can define multiple states separated by commas, e.g. state=active,closed
+        :param start: The starting index of the returned sprints.
+                      Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of sprints to return per page.
+                      Default: 50.
+                      See the 'Pagination' section at the top of this page for more details.
+        :return:
+        """
+        params = {}
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        if state:
+            params["state"] = state
+        url = "rest/agile/1.0/board/{boardId}/sprint".format(boardId=board_id)
+        return self.get(url, params=params)
+
+    @deprecated(version="3.42.0", reason="Use get_all_sprints_from_board instead")
+    def get_all_sprint(self, board_id, state=None, start=0, limit=50):
+        """
+        Returns all sprints from a board, for a given board ID.
+        :param board_id:
+        :param state:
+        :param start:
+        :param limit:
+        :return:
+        """
+        return self.get_all_sprints_from_board(board_id, state, start, limit)
+
+    def get_all_issues_for_sprint_in_board(
+        self, board_id, sprint_id, jql="", validateQuery=True, fields="", expand="", start=0, limit=50
+    ):
+        """
+        Get all issues you have access to that belong to the sprint from the board.
+        Issue returned from this resource contains additional fields like: sprint, closedSprints, flagged and epic.
+        Issues are returned ordered by rank. JQL order has higher priority than default rank.
+        :param board_id:
+        :param sprint_id:
+        :param jql: Filter results using a JQL query.
+                    If you define an order in your JQL query,
+                    it will override the default order of the returned issues.
+        :param validateQuery: Specifies whether to validate the JQL query or not. Default: true.
+        :param fields: The list of fields to return for each issue.
+                       By default, all navigable and Agile fields are returned.
+        :param expand: A comma-separated list of the parameters to expand.
+        :param start: The starting index of the returned issues.
+                      Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of issues to return per page.
+                      Default: 50.
+                      See the 'Pagination' section at the top of this page for more details.
+                      Note, the total number of issues returned is limited by the property
+                      'jira.search.views.default.max' in your JIRA instance.
+                      If you exceed this limit, your results will be truncated.
+        """
+        url = "/rest/agile/1.0/board/{boardId}/sprint/{sprintId}/issue".format(boardId=board_id, sprintId=sprint_id)
+        params = {}
+        if jql:
+            params["jql"] = jql
+        if validateQuery:
+            params["validateQuery"] = validateQuery
+        if fields:
+            params["fields"] = fields
+        if expand:
+            params["expand"] = expand
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        return self.get(url, params=params)
+
+    # /rest/agile/1.0/board/{boardId}/version
+    def get_all_versions_from_board(self, board_id, released="true", start=0, limit=50):
+        """
+        Returns all versions from a board, for a given board ID.
+        This only includes versions that the user has permission to view.
+        Note, if the user does not have permission to view the board,
+        no versions will be returned at all.
+        Returned versions are ordered by the name of the project from which they belong and
+        then by sequence defined by user.
+        :param board_id:
+        :param released: Filter results to versions that are either released or
+                         unreleased.Valid values: true, false.
+        :param start: The starting index of the returned versions.
+                      Base index: 0.
+                      See the 'Pagination' section at the top of this page for more details.
+        :param limit: The maximum number of versions to return per page.
+                      Default: 50.
+                      See the 'Pagination' section at the top of this page for more details.
+        :return:
+        """
+        params = {}
+        if released:
+            params["released"] = released
+        if start:
+            params["startAt"] = start
+        if limit:
+            params["maxResults"] = limit
+        url = "rest/agile/1.0/board/{boardId}/version".format(boardId=board_id)
+        return self.get(url, params=params)
 
     def create_sprint(self, name, board_id, start_date=None, end_date=None, goal=None):
         """
@@ -4432,32 +4787,6 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         url = "/rest/agile/1.0/sprint/{sprint_id}/issue".format(sprint_id=sprint_id)
         data = dict(issues=issues)
         return self.post(url, data=data)
-
-    def get_all_sprint(self, board_id, state=None, start=0, limit=50):
-        """
-        Returns all sprints from a board, for a given board ID.
-        This only includes sprints that the user has permission to view.
-        :param board_id:
-        :param state: Filter results to sprints in specified states.
-                      Valid values: future, active, closed.
-                      You can define multiple states separated by commas, e.g. state=active,closed
-        :param start: The starting index of the returned sprints.
-                      Base index: 0.
-                      See the 'Pagination' section at the top of this page for more details.
-        :param limit: The maximum number of sprints to return per page.
-                      Default: 50.
-                      See the 'Pagination' section at the top of this page for more details.
-        :return:
-        """
-        params = {}
-        if start:
-            params["startAt"] = start
-        if limit:
-            params["maxResults"] = limit
-        if state:
-            params["state"] = state
-        url = "rest/agile/1.0/board/{boardId}/sprint".format(boardId=board_id)
-        return self.get(url, params=params)
 
     def get_sprint(self, sprint_id):
         """
