@@ -1,15 +1,25 @@
 # coding=utf-8
+import io
+import json
 import logging
 import os
-import time
-import json
 import re
-from requests import HTTPError
-import requests
-from deprecated import deprecated
+import time
+
 from bs4 import BeautifulSoup
+from deprecated import deprecated
+import requests
+from requests import HTTPError
+
 from atlassian import utils
-from .errors import ApiError, ApiNotFoundError, ApiPermissionError, ApiValueError, ApiConflictError, ApiNotAcceptable
+from .errors import (
+    ApiConflictError,
+    ApiError,
+    ApiNotAcceptable,
+    ApiNotFoundError,
+    ApiPermissionError,
+    ApiValueError,
+)
 from .rest_client import AtlassianRestAPI
 
 log = logging.getLogger(__name__)
@@ -1390,40 +1400,85 @@ class Confluence(AtlassianRestAPI):
             comment=comment,
         )
 
-    def download_attachments_from_page(self, page_id, path=None, start=0, limit=50):
+    def download_attachments_from_page(self, page_id, path=None, start=0, limit=50, filename=None, to_memory=False):
         """
-        Downloads all attachments from a page
-        :param page_id:
-        :param path: OPTIONAL: path to directory where attachments will be saved. If None, current working directory will be used.
-        :param start: OPTIONAL: The start point of the collection to return. Default: None (0).
-        :param limit: OPTIONAL: The limit of the number of attachments to return, this may be restricted by
-                                fixed system limits. Default: 50
-        :return info message: number of saved attachments + path to directory where attachments were saved:
+        Downloads attachments from a Confluence page. Supports downloading all files or a specific file. 
+        Files can either be saved to disk or returned as BytesIO objects for in-memory handling.
+
+        :param page_id: str
+            The ID of the Confluence page to fetch attachments from.
+        :param path: str, optional
+            Directory where attachments will be saved. If None, defaults to the current working directory.
+            Ignored if `to_memory` is True.
+        :param start: int, optional
+            The start point for paginated attachment fetching. Default is 0. Ignored if `filename` is specified.
+        :param limit: int, optional
+            The maximum number of attachments to fetch per request. Default is 50. Ignored if `filename` is specified.
+        :param filename: str, optional
+            The name of a specific file to download. If provided, only this file will be fetched.
+        :param to_memory: bool, optional
+            If True, attachments are returned as a dictionary of {filename: BytesIO object}.
+            If False, files are written to the specified directory on disk.
+        :return:
+            - If `to_memory` is True, returns a dictionary {filename: BytesIO object}.
+            - If `to_memory` is False, returns a summary dict: {"attachments_downloaded": int, "path": str}.
+        :raises:
+            - FileNotFoundError: If the specified path does not exist.
+            - PermissionError: If there are permission issues with the specified path.
+            - requests.HTTPError: If the HTTP request to fetch an attachment fails.
+            - Exception: For any unexpected errors.
         """
-        if path is None:
+        # Default path to current working directory if not provided
+        if not to_memory and path is None:
             path = os.getcwd()
+
         try:
-            attachments = self.get_attachments_from_content(page_id=page_id, start=start, limit=limit)["results"]
-            if not attachments:
-                return "No attachments found"
+            # Fetch attachments based on the specified parameters
+            if filename:
+                # Fetch specific file by filename
+                attachments = self.get_attachments_from_content(page_id=page_id, filename=filename)["results"]
+                if not attachments:
+                    return "No attachment with filename '{0}' found on the page.".format(filename)
+            else:
+                # Fetch all attachments with pagination
+                attachments = self.get_attachments_from_content(page_id=page_id, start=start, limit=limit)["results"]
+                if not attachments:
+                    return "No attachments found on the page."
+
+            # Prepare to handle downloads
+            downloaded_files = {}
             for attachment in attachments:
-                file_name = attachment["title"]
-                if not file_name:
-                    file_name = attachment["id"]  # if the attachment has no title, use attachment_id as a filename
+                file_name = attachment["title"] or attachment["id"]  # Use attachment ID if title is unavailable
                 download_link = self.url + attachment["_links"]["download"]
-                r = self._session.get(download_link)
-                file_path = os.path.join(path, file_name)
-                with open(file_path, "wb") as f:
-                    f.write(r.content)
+
+                # Fetch the file content
+                response = self._session.get(download_link)
+                response.raise_for_status()  # Raise error if request fails
+
+                if to_memory:
+                    # Store in BytesIO object
+                    file_obj = io.BytesIO(response.content)
+                    downloaded_files[file_name] = file_obj
+                else:
+                    # Save file to disk
+                    file_path = os.path.join(path, file_name)
+                    with open(file_path, "wb") as file:
+                        file.write(response.content)
+
+            # Return results based on storage mode
+            if to_memory:
+                return downloaded_files
+            else:
+                return {"attachments_downloaded": len(attachments), "path": path}
+
         except NotADirectoryError:
-            raise NotADirectoryError("Verify if directory path is correct and/or if directory exists")
+            raise FileNotFoundError("The directory '{path}' does not exist.".format(path=path))
         except PermissionError:
-            raise PermissionError(
-                "Directory found, but there is a problem with saving file to this directory. Check directory permissions"
-            )
-        except Exception as e:
-            raise e
-        return {"attachments downloaded": len(attachments), " to path ": path}
+            raise PermissionError("Permission denied when trying to save files to '{path}'.".format(path=path))
+        except requests.HTTPError as http_err:
+            raise Exception("HTTP error occurred while downloading attachments: {http_err}".format(http_err=http_err))
+        except Exception as err:
+            raise Exception("An unexpected error occurred: {error}".format(error=err))
 
     def delete_attachment(self, page_id, filename, version=None):
         """
@@ -2694,7 +2749,7 @@ class Confluence(AtlassianRestAPI):
             )
             if export_type == "csv":
                 form_data = {
-                    "atl_token": get_atl_request(f"spaces/exportspacecsv.action?key={space_key}"),
+                    "atl_token": get_atl_request("spaces/exportspacecsv.action?key={space_key}".format(space_key=space_key)),
                     "exportType": "TYPE_CSV",
                     "contentOption": "all",
                     "includeComments": "true",
@@ -2702,7 +2757,7 @@ class Confluence(AtlassianRestAPI):
                 }
             elif export_type == "html":
                 form_data = {
-                    "atl_token": get_atl_request(f"spaces/exportspacehtml.action?key={space_key}"),
+                    "atl_token": get_atl_request("spaces/exportspacehtml.action?key={space_key}".format(space_key=space_key)),
                     "exportType": "TYPE_HTML",
                     "contentOption": "visibleOnly",
                     "includeComments": "true",
@@ -2710,7 +2765,7 @@ class Confluence(AtlassianRestAPI):
                 }
             elif export_type == "xml":
                 form_data = {
-                    "atl_token": get_atl_request(f"spaces/exportspacexml.action?key={space_key}"),
+                    "atl_token": get_atl_request("spaces/exportspacexml.action?key={space_key}".format(space_key=space_key)),
                     "exportType": "TYPE_XML",
                     "contentOption": "all",
                     "includeComments": "true",
@@ -2722,7 +2777,7 @@ class Confluence(AtlassianRestAPI):
                 return self.get_pdf_download_url_for_confluence_cloud(url)
             else:
                 raise ValueError("Invalid export_type parameter value. Valid values are: 'html/csv/xml/pdf'")
-            url = self.url_joiner(url=self.url, path=f"spaces/doexportspace.action?key={space_key}")
+            url = self.url_joiner(url=self.url, path="spaces/doexportspace.action?key={space_key}".format(space_key=space_key))
 
             # Sending a POST request that triggers the space export.
             response = self.session.post(url, headers=self.form_token_headers, data=form_data)
