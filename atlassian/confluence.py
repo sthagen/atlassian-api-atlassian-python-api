@@ -146,23 +146,23 @@ class Confluence(AtlassianRestAPI):
         else:
             return False
 
-    def share_with_others(self,page_id, group, message):
+    def share_with_others(self, page_id, group, message):
         """
         Notify members (currently only groups implemented) about something on that page
         """
         url = "rest/share-page/latest/share"
         params = {
             "contextualPageId": page_id,
-            #"emails": [],
+            # "emails": [],
             "entityId": page_id,
             "entityType": "page",
             "groups": group,
-            "note": message
-            #"users":[]
+            "note": message,
+            # "users":[]
         }
-        r = self.post(url, json=params,headers={"contentType":"application/json; charset=utf-8"},advanced_mode=True)
+        r = self.post(url, json=params, headers={"contentType": "application/json; charset=utf-8"}, advanced_mode=True)
         if r.status_code != 200:
-            raise Exception("failed sharing content {code}: {reason}".format(code=r.status_code,reason=r.text))
+            raise Exception("failed sharing content {code}: {reason}".format(code=r.status_code, reason=r.text))
 
     def get_page_child_by_type(self, page_id, type="page", start=None, limit=None, expand=None):
         """
@@ -1468,9 +1468,8 @@ class Confluence(AtlassianRestAPI):
             for attachment in attachments:
                 file_name = attachment["title"] or attachment["id"]  # Use attachment ID if title is unavailable
                 download_link = self.url + attachment["_links"]["download"]
-
                 # Fetch the file content
-                response = self._session.get(download_link)
+                response = self._session.get(str(download_link))
                 response.raise_for_status()  # Raise error if request fails
 
                 if to_memory:
@@ -1488,7 +1487,6 @@ class Confluence(AtlassianRestAPI):
                 return downloaded_files
             else:
                 return {"attachments_downloaded": len(attachments), "path": path}
-
         except NotADirectoryError:
             raise FileNotFoundError("The directory '{path}' does not exist.".format(path=path))
         except PermissionError:
