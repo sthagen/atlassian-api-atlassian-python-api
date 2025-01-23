@@ -223,7 +223,7 @@ class Jira(AtlassianRestAPI):
     def get_attachments_ids_from_issue(self, issue):
         """
         Get attachments IDs from jira issue
-        :param jira issue key: str
+        :param issue: str : jira issue key
         :return: list of integers attachment IDs
         """
         issue_id = self.get_issue(issue)["fields"]["attachment"]
@@ -656,12 +656,16 @@ class Jira(AtlassianRestAPI):
     def get_custom_fields(self, search=None, start=1, limit=50):
         """
         Get custom fields. Evaluated on 7.12
+        Get fields paginated in cloud
         :param search: str
         :param start: long Default: 1
         :param limit: int Default: 50
         :return:
         """
-        url = self.resource_url("customFields")
+        if self.cloud:
+            url = self.resource_url("field/search")
+        else:
+            url = self.resource_url("customFields")
         params = {}
         if search:
             params["search"] = search
@@ -1382,7 +1386,7 @@ class Jira(AtlassianRestAPI):
 
     def update_issue(self, issue_key, update):
         """
-        :param issue: the issue to update
+        :param issue_key: the issue to update
         :param update: the update to make
         :return: True if successful, False if not
         """
@@ -1391,7 +1395,7 @@ class Jira(AtlassianRestAPI):
 
     def label_issue(self, issue_key, labels):
         """
-        :param issue: the issue to update
+        :param issue_key: the issue to update
         :param labels: the labels to add
         :return: True if successful, False if not
         """
@@ -1400,7 +1404,7 @@ class Jira(AtlassianRestAPI):
 
     def unlabel_issue(self, issue_key, labels):
         """
-        :param issue: the issue to update
+        :param issue_key: the issue to update
         :param labels: the labels to remove
         :return: True if successful, False if not
         """
