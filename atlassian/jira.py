@@ -3345,6 +3345,16 @@ class Jira(AtlassianRestAPI):
         :param validate_query: OPTIONAL: Whether to validate the JQL query
         :return:
         """
+        if self.cloud:
+            if start == 0:
+                return self.enhanced_jql(
+                    jql=jql,
+                    fields=fields,
+                    limit=limit,
+                    expand=expand,
+                )
+            else:
+                raise ValueError("The `jql` method is deprecated in Jira Cloud. Use `enhanced_jql` method instead.")
         params = {}
         if start is not None:
             params["startAt"] = int(start)
@@ -3362,6 +3372,62 @@ class Jira(AtlassianRestAPI):
             params["validateQuery"] = validate_query
         url = self.resource_url("search")
         return self.get(url, params=params)
+
+    def enhanced_jql(
+        self,
+        jql,
+        fields="*all",
+        nextPageToken=None,
+        limit=None,
+        expand=None,
+    ):
+        """
+        Get issues from jql search result with all related fields
+        :param jql:
+        :param fields: list of fields, for example: ['priority', 'summary', 'customfield_10007']
+        :param nextPageToken (Optional[str]): Token for paginated results. Default: None.
+        :param limit: OPTIONAL: The limit of the number of issues to return, this may be restricted by
+                fixed system limits. Default by built-in method: 50
+        :param expand: OPTIONAL: expand the search result
+        :return:
+        """
+
+        if not self.cloud:
+            raise ValueError("``enhanced_jql`` method is only available for Jira Cloud platform")
+        params = {}
+        if nextPageToken is not None:
+            params["nextPageToken"] = str(nextPageToken)
+        if limit is not None:
+            params["maxResults"] = int(limit)
+        if fields is not None:
+            if isinstance(fields, (list, tuple, set)):
+                fields = ",".join(fields)
+            params["fields"] = fields
+        if jql is not None:
+            params["jql"] = jql
+        if expand is not None:
+            params["expand"] = expand
+        url = self.resource_url("search/jql")
+        return self.get(url, params=params)
+
+    def approximate_issue_count(
+        self,
+        jql,
+    ):
+        """
+        Get an approximate count of issues matching a JQL search string.
+
+        :param jql: The JQL search string.
+        :return: The issue count.
+        """
+
+        if not self.cloud:
+            raise ValueError("``approximate_issue_count`` method is only available for Jira Cloud platform")
+
+        data = {"jql": jql}
+
+        url = self.resource_url("search/approximate-count")
+        return self.post(url, data)
 
     def jql_get_list_of_tickets(
         self,
@@ -3383,6 +3449,19 @@ class Jira(AtlassianRestAPI):
         :param validate_query: Whether to validate the JQL query
         :return:
         """
+        if self.cloud:
+            if start == 0:
+                return self.enhanced_jql_get_list_of_tickets(
+                    jql=jql,
+                    fields=fields,
+                    limit=limit,
+                    expand=expand,
+                )
+            else:
+                raise ValueError(
+                    "The `jql_get_list_of_tickets` method is deprecated in Jira Cloud. Use `enhanced_jql_get_list_of_tickets` method instead."
+                )
+
         params = {}
         if limit is not None:
             params["maxResults"] = int(limit)
@@ -3413,7 +3492,60 @@ class Jira(AtlassianRestAPI):
             if limit is not None or total <= len(response["issues"]) + start:
                 break
             start += len(issues)
+        return results
 
+    def enhanced_jql_get_list_of_tickets(
+        self,
+        jql,
+        fields="*all",
+        limit=None,
+        expand=None,
+    ):
+        """
+        Get issues from JQL search result with all related fields using nextPageToken pagination.
+
+        Applicable only for Jira Cloud.
+
+        :param jql: The JQL search string.
+        :param fields: List of fields, for example: ['priority', 'summary', 'customfield_10007']
+        :param limit: OPTIONAL: The limit of the number of issues to return, this may be restricted by
+                    fixed system limits. Default by built-in method: 50
+        :param expand: OPTIONAL: Expand the search result.
+        :return: List of issues.
+        """
+
+        if not self.cloud:
+            raise ValueError("``enhanced_jql_get_list_of_tickets`` is only available for Jira Cloud.")
+
+        params = {}
+        if limit is not None:
+            params["maxResults"] = int(limit)
+        if fields is not None:
+            if isinstance(fields, (list, tuple, set)):
+                fields = ",".join(fields)
+            params["fields"] = fields
+        if jql is not None:
+            params["jql"] = jql
+        if expand is not None:
+            params["expand"] = expand
+
+        url = self.resource_url("search/jql")
+        results = []
+        next_page_token = None
+
+        while True:
+            if next_page_token is not None:
+                params["nextPageToken"] = next_page_token
+
+            response = self.get(url, params=params)
+            if not response:
+                break
+
+            issues = response["issues"]
+            results.extend(issues)
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token or (limit is not None and len(results) >= limit):
+                break
         return results
 
     def csv(self, jql, limit=1000, all_fields=True, start=None, delimiter=None):
@@ -3632,7 +3764,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         :return:
         """
         app_headers = {
-            "X-Atlassian-Token": "nocheck",
+            "X-Atlassian-Token": "no-check",
             "Content-Type": "application/vnd.atl.plugins+json",
         }
         url = f"/plugins/1.0/{plugin_key}/license"
@@ -3646,7 +3778,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         :return:
         """
         app_headers = {
-            "X-Atlassian-Token": "nocheck",
+            "X-Atlassian-Token": "no-check",
             "Content-Type": "application/vnd.atl.plugins+json",
         }
         url = f"rest/plugins/1.0/{plugin_key}-key"
@@ -3660,7 +3792,7 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         :return:
         """
         app_headers = {
-            "X-Atlassian-Token": "nocheck",
+            "X-Atlassian-Token": "no-check",
             "Content-Type": "application/vnd.atl.plugins+json",
         }
         url = f"rest/plugins/1.0/{plugin_key}-key"
