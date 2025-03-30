@@ -245,8 +245,22 @@ Manage issues
     # Check issue deleted
     jira.issue_deleted(issue_key)
 
-    # Update issue
-    jira.issue_update(issue_key, fields)
+    # Update issue fields and history metadata
+    issue_key="PROJECT-123",
+    fields={"summary": "Updated summary", "priority": {"id": "2"}},
+    update={
+        "labels": [{"add": "triaged"}, {"remove": "blocker"}],
+        "timetracking": [{"edit": {"originalEstimate": "2d", "remainingEstimate": "1d"}}]
+    },
+    history_metadata={
+        "activityDescription": "Updated via API",
+        "actor": {"id": "user123", "type": "application-user"},
+        "type": "custom-update"
+    },
+    properties=[
+        {"key": "customKey1", "value": "Custom Value 1"}
+    ]
+    jira.issue_update(issue_key: str, fields: Union[str, dict], update: dict = None, history_metadata: dict = None, properties: list = None, notify_users: bool = True)
 
     # Assign issue to user
     jira.assign_issue(issue_key, account_id)
@@ -587,6 +601,16 @@ Cluster methods (only for DC edition)
 
     # Request current index from node (the request is processed asynchronously).
     jira.request_current_index_from_node(node_id)
+
+    # Get cluster nodes where alive = True
+    jira.get_cluster_alive_nodes()
+
+    # Change the node's state to offline if the node is reporting as active, but is not alive
+    jira.set_node_to_offline(node_id)
+
+    #  Delete the node from the cluster if state of node is OFFLINE
+    jira.delete_cluster_node(node_id)
+
 
 Health checks methods (only for on-prem edition)
 ------------------------------------------------
