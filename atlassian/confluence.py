@@ -647,24 +647,80 @@ class Confluence(AtlassianRestAPI):
         content_type="page",
     ):
         """
-        Get all pages from space
+         Retrieve all pages from a Confluence space.
 
-        :param space:
-        :param start: OPTIONAL: The start point of the collection to return. Default: None (0).
-        :param limit: OPTIONAL: The limit of the number of pages to return, this may be restricted by
-                            fixed system limits. Default: 50
-        :param status: OPTIONAL: list of statuses the content to be found is in.
-                                 Defaults to current is not specified.
-                                 If set to 'any', content in 'current' and 'trashed' status will be fetched.
-                                 Does not support 'historical' status for now.
-        :param expand: OPTIONAL: a comma separated list of properties to expand on the content.
-                                 Default value: history,space,version.
-        :param content_type: the content type to return. Default value: page. Valid values: page, blogpost.
-        :return:
+        :param space: The space key to fetch pages from.
+        :param start: OPTIONAL: The starting point of the collection. Default: 0.
+        :param limit: OPTIONAL: The maximum number of pages per request. Default: 50.
+        :param status: OPTIONAL: Filter pages by status ('current', 'trashed', 'any'). Default: None.
+        :param expand: OPTIONAL: Comma-separated list of properties to expand. Default: history,space,version.
+        :param content_type: OPTIONAL: The content type to return ('page', 'blogpost'). Default: page.
+        :return: List containing all pages from the specified space.
         """
-        return self.get_all_pages_from_space_raw(
-            space=space, start=start, limit=limit, status=status, expand=expand, content_type=content_type
-        ).get("results")
+        all_pages = []  # Initialize an empty list to store all pages
+        while True:
+            # Fetch a single batch of pages
+            response = self.get_all_pages_from_space_raw(
+                space=space,
+                start=start,
+                limit=limit,
+                status=status,
+                expand=expand,
+                content_type=content_type,
+            )
+
+            # Extract results from the response
+            results = response.get("results", [])
+            all_pages.extend(results)  # Add the current batch of pages to the list
+
+            # Break the loop if no more pages are available
+            if len(results) < limit:
+                break
+
+            # Increment the start index for the next batch
+            start += limit
+        return all_pages
+
+    def get_all_pages_from_space_as_generator(
+        self,
+        space,
+        start=0,
+        limit=50,
+        status=None,
+        expand="history,space,version",
+        content_type="page",
+    ):
+        """
+        Retrieve all pages from a Confluence space using pagination.
+
+        :param space: The space key to fetch pages from.
+        :param start: OPTIONAL: The starting point of the collection. Default: 0.
+        :param limit: OPTIONAL: The maximum number of pages per request. Default: 50.
+        :param status: OPTIONAL: Filter pages by status ('current', 'trashed', 'any'). Default: None.
+        :param expand: OPTIONAL: Comma-separated list of properties to expand. Default: history,space,version.
+        :param content_type: OPTIONAL: The content type to return ('page', 'blogpost'). Default: page.
+        :return: Generator yielding pages one by one.
+        """
+        while True:
+            # Fetch a single batch of pages
+            response = self.get_all_pages_from_space_raw(
+                space=space,
+                start=start,
+                limit=limit,
+                status=status,
+                expand=expand,
+                content_type=content_type,
+            )
+
+            # Extract results from the response
+            results = response.get("results", [])
+            yield from results  # Yield each page individually
+
+            # Break the loop if no more pages are available
+            if len(results) < limit:
+                break
+            start += limit
+        pass
 
     def get_all_pages_from_space_trash(self, space, start=0, limit=500, status="trashed", content_type="page"):
         """
@@ -1238,7 +1294,7 @@ class Confluence(AtlassianRestAPI):
     def get_all_spaces(
         self,
         start=0,
-        limit=500,
+        limit=50,
         expand=None,
         space_type=None,
         space_status=None,
@@ -2425,7 +2481,7 @@ class Confluence(AtlassianRestAPI):
             else:
                 members.extend(values)
         if not members:
-            print((f"Did not get members from {group_name} group, please check permissions or connectivity"))
+            print(f"Did not get members from {group_name} group, please check permissions or connectivity")
         return members
 
     def get_space(self, space_key, expand="description.plain,homepage", params=None):
@@ -3314,6 +3370,250 @@ class Confluence(AtlassianRestAPI):
         """
         url = "rest/api/user/%s/group/%s" % (username, group_name)
         return self.put(url)
+
+    # Space Permissions
+    def get_all_space_permissions(self, space_key):
+        """
+        Returns list of permissions granted to users and groups in the particular space.
+        :param space_key:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions"
+        return self.get(url)
+
+    def set_permissions_to_multiple_items_for_space(self, space_key, user_key=None, group_name=None, operations=None):
+        """
+        Sets permissions to multiple users/groups in the given space.
+        Request should contain all permissions that user/group/anonymous user will have in a given space.
+        If permission is absent in the request, but was granted before, it will be revoked.
+        If empty list of permissions passed to user/group/anonymous user,
+        then all their existing permissions will be revoked.
+        If user/group/anonymous user not mentioned in the request, their permissions will not be revoked.
+
+        Maximum 40 different users/groups/anonymous user could be passed in the request.
+        :param space_key:
+        :param user_key:
+        :param group_name:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions"
+        params = []
+
+        if user_key:
+            params.append({"userKey": user_key, "operations": operations or []})
+
+        if group_name:
+            params.append({"groupName": group_name, "operations": operations or []})
+
+        if not user_key and not group_name:
+            params.append({"operations": operations or []})
+        payload_json = json.dumps(params)
+        return self.post(url, data=payload_json)
+
+    def get_permissions_granted_to_anonymous_for_space(self, space_key):
+        """
+        Get permissions granted to anonymous user for the given space
+        :param space_key:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/anonymous"
+        return self.get(url)
+
+    def set_permissions_to_anonymous_for_space(self, space_key, operations=None):
+        """
+        Grant permissions to anonymous user in the given space. Operation doesn't override existing permissions,
+        will only add those one that weren't granted before. Multiple permissions could be passed in one request.
+        Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/anonymous"
+        data = {"operations": operations or []}
+        return self.put(url, data=data)
+
+    def remove_permissions_from_anonymous_for_space(self, space_key, operations=None):
+        """
+        Revoke permissions from anonymous user in the given space.
+        If anonymous user doesn't have permissions that we are trying to revoke,
+        those permissions will be silently skipped. Multiple permissions could be passed in one request.
+        Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/anonymous/revoke"
+        data = {"operations": operations or []}
+        return self.put(url, data=data)
+
+    def get_permissions_granted_to_group_for_space(self, space_key, group_name):
+        """
+        Get permissions granted to group for the given space
+        :param space_key:
+        :param group_name:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/group/{group_name}"
+        return self.get(url)
+
+    def set_permissions_to_group_for_space(self, space_key, group_name, operations=None):
+        """
+        Grant permissions to group in the given space.
+        Operation doesn't override existing permissions, will only add those one that weren't granted before.
+        Multiple permissions could be passed in one request. Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param group_name:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/group/{group_name}"
+        data = {"operations": operations or []}
+        return self.put(url, data=data)
+
+    def remove_permissions_from_group_for_space(self, space_key, group_name, operations=None):
+        """
+        Revoke permissions from a group in the given space.
+        If group doesn't have permissions that we are trying to revoke,
+        those permissions will be silently skipped. Multiple permissions could be passed in one request.
+        Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param group_name:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/group/{group_name}/revoke"
+        data = {"operations": operations or []}
+        return self.put(url, data=data)
+
+    def get_permissions_granted_to_user_for_space(self, space_key, user_key):
+        """
+        Get permissions granted to user for the given space
+        :param space_key:
+        :param user_key:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/user/{user_key}"
+        return self.get(url)
+
+    def set_permissions_to_user_for_space(self, space_key, user_key, operations=None):
+        """
+        Grant permissions to user in the given space.
+        Operation doesn't override existing permissions, will only add those one that weren't granted before.
+        Multiple permissions could be passed in one request. Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param user_key:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/user/{user_key}"
+        data = {"operations": operations or []}
+        return self.put(url, data=data)
+
+    def remove_permissions_from_user_for_space(self, space_key, user_key, operations=None):
+        """
+        Revoke permissions from a user in the given space.
+        If user doesn't have permissions that we are trying to revoke,
+        those permissions will be silently skipped. Multiple permissions could be passed in one request.
+        Supported targetType and operationKey pairs:
+
+        space read
+        space administer
+        space export
+        space restrict
+        space delete_own
+        space delete_mail
+        page create
+        page delete
+        blogpost create
+        blogpost delete
+        comment create
+        comment delete
+        attachment create
+        attachment delete
+        :param space_key:
+        :param user_key:
+        :param operations:
+        :return:
+        """
+        url = f"rest/api/space/{space_key}/permissions/user/{user_key}/revoke"
+        data = {"operations": operations or []}
+        return self.put(url, params=data)
 
     def add_space_permissions(
         self,
