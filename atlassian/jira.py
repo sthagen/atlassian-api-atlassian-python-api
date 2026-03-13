@@ -239,7 +239,7 @@ class Jira(AtlassianRestAPI):
         :param issue: str : jira issue key
         :return: list of integers attachment IDs
         """
-        issue_id = self.get_issue(issue)["fields"]["attachment"]
+        issue_id = self.get_issue(issue, fields="attachment")["fields"]["attachment"]
         list_attachments_id = []
         for attachment in issue_id:
             list_attachments_id.append({"filename": attachment["filename"], "attachment_id": attachment["id"]})
@@ -255,14 +255,68 @@ class Jira(AtlassianRestAPI):
         url = f"{base_url}/{attachment_id}"
         return self.get(url)
 
-    def download_issue_attachments(self, issue: T_id, path: Optional[str] = None) -> Optional[str]:
+    def download_issue_attachments(
+        self,
+        issue: str,
+        path: Optional[str] = None,
+        overwrite: bool = False,
+        stream: bool = False,
+        block_size: Optional[int] = 16384,
+        timeout: Optional[int] = None,
+    ) -> Optional[str]:
         """
         Downloads all attachments from a Jira issue.
         :param issue: The issue-key of the Jira issue
         :param path: Path to directory where attachments will be saved. If None, current working directory will be used.
+        :param overwrite: If True, always download and create new zip file.
+                          If False (default), download will be skipped when zip file already exists in path.
+        :param stream: If True, request stream mode will be used to download and write files.
+                       If False (default), whole attachment content will be downloaded into memory first, then will be written to disk afterwards.
+        :param block_size: Block size of each stream content chunks. This option is only applicable when stream=True is set.
+                           Default size of 16 KiB is used to balance speed and memory usage.
+                           Smaller value will decrease memory usage, but may also decrease download speed if too small.
+        :param timeout: Request timeout parameter in seconds. None (default) will never cause timeout.
         :return: A message indicating the result of the download operation.
         """
-        return self.download_attachments_from_issue(issue=issue, path=path, cloud=self.cloud)
+        try:
+            if path is None:
+                path = os.getcwd()
+            issue_id = self.issue(issue, fields="id")["id"]
+            attachment_name = f"{issue_id}_attachments.zip"
+            file_path = os.path.join(path, attachment_name)
+            if not overwrite and os.path.isfile(file_path):
+                return "File already exists"
+
+            if self.cloud:
+                url = self.url + f"/secure/issueAttachments/{issue_id}.zip"
+            else:
+                url = self.url + f"/secure/attachmentzip/{issue_id}.zip"
+            response = self._session.get(url, stream=stream, timeout=timeout)
+            response.raise_for_status()
+
+            # if Jira issue doesn't have any attachments _session.get
+            # request response will return 22 bytes of PKzip format
+            file_size = int(response.headers.get("Content-Length", 0))
+            if file_size == 22:
+                return "No attachments found on the Jira issue"
+
+            with open(file_path, "wb") as file:
+                if not stream:
+                    file.write(response.content)
+                else:
+                    for data in response.iter_content(block_size):
+                        file.write(data)
+
+            return "Attachments downloaded successfully"
+
+        except FileNotFoundError:
+            raise FileNotFoundError("Verify if directory path is correct and/or if directory exists")
+        except PermissionError:
+            raise PermissionError(
+                "Directory found, but there is a problem with saving file to this directory. Check directory permissions"
+            )
+        except Exception as e:
+            raise e
 
     @deprecated(version="3.41.20", reason="Use download_issue_attachments instead")
     def download_attachments_from_issue(
@@ -312,9 +366,17 @@ class Jira(AtlassianRestAPI):
         :param attachment_id: int
         :return: content as bytes
         """
-        base_url = self.resource_url("attachment")
-        url = f"{base_url}/content/{attachment_id}"
-        return self.get(url, not_json_response=True)
+        attachment_info = self.get_attachment(attachment_id)
+        # Type check for mypy. If attachment is not found, or unavailable, it would raise HTTPError anyways.
+        if attachment_info is None:
+            return b""
+        url = attachment_info["content"]
+        return self.get(
+            url,
+            not_json_response=True,
+            absolute=True,
+            headers={"Accept": "*/*"},
+        )
 
     def remove_attachment(self, attachment_id: T_id) -> T_resp_json:
         """
@@ -712,6 +774,60 @@ class Jira(AtlassianRestAPI):
         base_url = self.resource_url("customFieldOption")
         url = f"{base_url}/{option_id}"
         return self.get(url)
+
+    def get_custom_field_options(
+        self,
+        field_id: T_id,
+        project_id: T_id,
+        issue_type_id: Union[T_id, list[str], None] = None,
+        query: Optional[str] = None,
+        page: Optional[int] = None,
+        limit: Optional[int] = None,
+        sort: Optional[bool] = None,
+        use_all_contexts: Optional[bool] = None,
+    ) -> T_resp_json:
+        """
+        Get list of all options available for a custom field in a specified project.
+        Numeric field ID and numeric project ID must be used.
+
+        This is Experimental API available to Jira data Center.
+        At the time of testing, providing multiple project IDs results in 404 response.
+
+        Reference: https://developer.atlassian.com/server/jira/platform/rest/v11003/api-group-customfields/#api-api-2-customfields-customfieldid-options-get
+
+        :param field_id: str - The ID of the custom field.
+        :param project_id: str - The project ID in a context.
+        :param issue_type_id: str, Optional - A list of issue type IDs in a context.
+        :param query: str, Optional - A string used to filter options.
+        :param page: int, Optional - The page of options to return, starting from 1.
+        :param limit: int, Optional - The maximum number of results to return. If empty, return all results.
+        :param sort: bool, Optional - Flag to sort options by their names.
+        :param use_all_contexts: bool, Optional - Flag to fetch all options regardless of context, project IDs, or issue type IDs.
+        """
+        url = self.resource_url(
+            f"customFields/{field_id}/options",
+            api_version=2,
+        )
+        params: dict = {}
+        if project_id:
+            if isinstance(project_id, (list, tuple, set)):
+                project_id = ",".join(project_id)
+            params["projectIds"] = project_id
+        if issue_type_id:
+            if isinstance(issue_type_id, (list, tuple, set)):
+                issue_type_id = ",".join(issue_type_id)
+            params["issueTypeIds"] = issue_type_id
+        if query:
+            params["query"] = query
+        if page is not None:
+            params["page"] = page
+        if limit is not None:
+            params["maxResults"] = limit
+        if sort is not None:
+            params["sortByOptionName"] = sort
+        if use_all_contexts is not None:
+            params["useAllContexts"] = use_all_contexts
+        return self.get(url, params=params)
 
     def get_custom_fields(self, search: Optional[str] = None, start: int = 1, limit: int = 50) -> T_resp_json:
         """
@@ -1833,7 +1949,7 @@ class Jira(AtlassianRestAPI):
         list: A list of matches.
         """
         regex_output = []
-        issue_output = self.get_issue(issue)
+        issue_output = self.get_issue(issue, fields="description,comment")
         description = issue_output["fields"]["description"]
         comments = issue_output["fields"]["comment"]["comments"]
 
@@ -1903,7 +2019,7 @@ class Jira(AtlassianRestAPI):
         # Check the recursion depth. In case of any bugs that would result in infinite recursion, this will prevent the function from crashing your app. Python default for REcursionError  is 1000
         if depth > 150:
             raise Exception("Recursion depth exceeded")
-        issue = self.get_issue(issue_key)
+        issue = self.get_issue(issue_key, fields="issuelinks,subtasks")
         issue_links = issue["fields"]["issuelinks"]
         subtasks = issue["fields"]["subtasks"]
         for issue_link in issue_links:
@@ -2056,7 +2172,7 @@ class Jira(AtlassianRestAPI):
 
     def get_issue_status_changelog(self, issue_id: T_id):
         # Get the issue details with changelog
-        response_get_issue = self.get_issue(issue_id, expand="changelog")
+        response_get_issue = self.get_issue(issue_id, fields="id", expand="changelog")
         status_change_history = []
         for history in response_get_issue["changelog"]["histories"]:
             for item in history["items"]:
@@ -3909,6 +4025,60 @@ class Jira(AtlassianRestAPI):
         base_url = self.resource_url("priority")
         url = f"{base_url}/{priority_id}"
         return self.get(url)
+
+    def get_autocomplete_data(self) -> T_resp_json:
+        """
+        Returns full information about visible fields that can be autocompleted in JQL.
+
+        Available in Jira Data Center, Jira Cloud v2, Jira Cloud v3.
+
+        Reference: https://developer.atlassian.com/server/jira/platform/rest/v11003/api-group-jql/#api-api-2-jql-autocompletedata-get
+                   https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-jql/#api-rest-api-2-jql-autocompletedata-get
+        :return:
+        """
+        url = self.resource_url("jql/autocompletedata")
+        return self.get(url)
+
+    def get_autocomplete_suggestion(
+        self,
+        field_name: Optional[str] = None,
+        field_value: Optional[str] = None,
+        predicate_name: Optional[str] = None,
+        predicate_value: Optional[str] = None,
+    ) -> T_resp_json:
+        """
+        Returns auto complete suggestions for JQL search.
+
+        Suggestions can be obtained by providing:
+
+            `fieldName` to get a list of all values for the field.
+            `fieldName` and `fieldValue` to get a list of values containing the text in `fieldValue`.
+            `fieldName` and `predicateName` to get a list of all predicate values for the field.
+            `fieldName`, `predicateName`, and `predicateValue` to get a list of predicate values containing the text in `predicateValue`.
+
+        Although auto complete suggestion can be used to retrieve possible option for a field,
+        it may be more appropriate to use `get_custom_field_options()` method to get project-specific options for a field.
+
+        Reference: https://developer.atlassian.com/server/jira/platform/rest/v11003/api-group-jql/#api-api-2-jql-autocompletedata-suggestions-get
+                   https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-jql/#api-rest-api-2-jql-autocompletedata-suggestions-get
+
+        :param field_name: str, Optional - The field name for which the suggestions are generated.
+        :param field_value: str, Optional - The portion of the field value that has already been provided by the user.
+        :param predicate_name: str, Optional - The predicate for which the suggestions are generated. Suggestions are generated only for: "by", "from" and "to".
+        :param predicate_value: str, Optional - The portion of the predicate value that has already been provided by the user.
+        :return:
+        """
+        url = self.resource_url("jql/autocompletedata/suggestions")
+        params: dict = {}
+        if field_name:
+            params["fieldName"] = field_name
+        if field_value:
+            params["fieldValue"] = field_value
+        if predicate_name:
+            params["predicateName"] = predicate_name
+        if predicate_value:
+            params["predicateValue"] = predicate_value
+        return self.get(url, params=params)
 
     """
     Workflow
