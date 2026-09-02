@@ -2,9 +2,13 @@
 """Tests for Jira Modules"""
 
 from unittest import TestCase
-from atlassian import jira
-from .mockup import mockup_server
+from unittest.mock import patch, sentinel
+
 from requests import HTTPError
+
+from atlassian import jira
+
+from .mockup import mockup_server
 
 
 class TestJira(TestCase):
@@ -16,10 +20,87 @@ class TestJira(TestCase):
         resp = self.jira.issue("FOO-123")
         self.assertEqual(resp["key"], "FOO-123")
 
+    def test_get_issue_remote_links_supports_json_list_responses(self):
+        links = self.jira.get_issue_remote_links("FOO-123")
+        self.assertEqual(links[0]["id"], 10001)
+        self.assertEqual(links[0]["object"]["title"], "Example")
+
+    @patch.object(jira.Jira, "get")
+    def test_get_all_application_roles(self, mock_get):
+        """Lists ApplicationRoles from the Server v2 resource."""
+        self.jira.get_all_application_roles()
+
+        mock_get.assert_called_once_with("rest/api/2/applicationrole")
+
+    @patch.object(jira.Jira, "get")
+    def test_get_application_role(self, mock_get):
+        """Gets one ApplicationRole from the Server v2 resource."""
+        self.jira.get_application_role("jira-software")
+
+        mock_get.assert_called_once_with("rest/api/2/applicationrole/jira-software")
+
+    @patch.object(jira.Jira, "put")
+    def test_update_application_roles_uses_etag_when_provided(self, mock_put):
+        roles = [{"key": "jira-software", "groups": ["jira-software-users"]}]
+
+        self.jira.update_application_roles(roles, if_match='"role-version"')
+
+        self.assertEqual(mock_put.call_args.args[0], "rest/api/2/applicationrole")
+        self.assertEqual(
+            mock_put.call_args.kwargs["data"], '[{"key": "jira-software", "groups": ["jira-software-users"]}]'
+        )
+        self.assertEqual(
+            mock_put.call_args.kwargs["headers"],
+            {"Content-Type": "application/json", "Accept": "application/json", "If-Match": '"role-version"'},
+        )
+
     def test_get_issue_not_found(self):
         """Receive HTTP Error when Issue does not exist"""
         with self.assertRaises(HTTPError):
             self.jira.issue("FOO-321")
+
+    @patch.object(jira.Jira, "get")
+    def test_get_custom_fields_uses_query_parameter_in_cloud(self, mock_get):
+        self.jira.get_custom_fields(search="Customer tier")
+
+        self.assertEqual(
+            mock_get.call_args.kwargs["params"], {"query": "Customer tier", "startAt": 1, "maxResults": 50}
+        )
+
+    @patch.object(jira.Jira, "get")
+    def test_get_all_fields_uses_v3_for_cloud(self, mock_get):
+        self.jira.get_all_fields()
+
+        mock_get.assert_called_once_with("rest/api/3/field")
+
+    @patch.object(jira.Jira, "get")
+    def test_enhanced_jql_uses_the_cloud_v3_endpoint(self, mock_get):
+        self.jira.enhanced_jql(
+            "created >= -30d ORDER BY created DESC",
+            fields="summary,description",
+            nextPageToken="next-token",
+            expand="names",
+        )
+
+        mock_get.assert_called_once_with(
+            "rest/api/3/search/jql",
+            params={
+                "jql": "created >= -30d ORDER BY created DESC",
+                "fields": "summary,description",
+                "nextPageToken": "next-token",
+                "expand": "names",
+            },
+        )
+
+    @patch.object(jira.Jira, "request")
+    def test_assign_project_permission_scheme_uses_v3_json_endpoint_in_cloud(self, mock_request):
+        self.jira.advanced_mode = True
+        mock_request.return_value = sentinel.response
+
+        result = self.jira.assign_project_permission_scheme("DEMO", 10000)
+
+        self.assertIs(result, sentinel.response)
+        mock_request.assert_called_once_with("PUT", path="rest/api/3/project/DEMO/permissionscheme", json={"id": 10000})
 
     def test_get_epic_issues(self):
         resp = self.jira.epic_issues("BAR-22")

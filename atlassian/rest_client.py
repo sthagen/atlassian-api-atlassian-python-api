@@ -35,6 +35,7 @@ except ImportError:
     from oauthlib.oauth1 import SIGNATURE_RSA
 
 from requests import HTTPError, Response, Session
+from requests.auth import AuthBase
 from requests_oauthlib import OAuth1, OAuth2
 from typing_extensions import Self
 from urllib3.util import Retry
@@ -46,6 +47,18 @@ T_resp_get = Union[Response, T_resp_json, str, bytes]
 
 
 log = get_default_logger(__name__)
+
+
+def _curl_quote(value: str) -> str:
+    """Quote a value for a POSIX shell cURL command."""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+class _ExplicitTokenAuth(AuthBase):
+    """Prevent Requests from replacing an explicit token with ``.netrc`` auth."""
+
+    def __call__(self, request):
+        return request
 
 
 class AtlassianRestAPI(object):
@@ -225,6 +238,11 @@ class AtlassianRestAPI(object):
 
     def _create_token_session(self, token: str) -> None:
         self._update_header("Authorization", f"Bearer {token.strip()}")
+        # Requests consults ``.netrc`` when no auth handler is set, even when
+        # an Authorization header is present. A no-op handler preserves the
+        # explicit Bearer token without disabling proxy and CA environment
+        # settings through ``Session.trust_env``.
+        self._session.auth = _ExplicitTokenAuth()
 
     def _create_header_session(self, header: dict) -> None:
         self._session.headers.update(header)
@@ -325,6 +343,10 @@ class AtlassianRestAPI(object):
         if delay_seconds is None:
             return None
 
+        if not math.isfinite(delay_seconds):
+            log.debug("Retry-After value is not finite; clamping to max_backoff_seconds")
+            delay_seconds = float(self.max_backoff_seconds)
+
         delay_seconds = max(0.0, delay_seconds)
         if delay_seconds > self.max_backoff_seconds:
             log.debug(
@@ -386,7 +408,7 @@ class AtlassianRestAPI(object):
         self,
         method: str,
         url: str,
-        data: Union[dict, str, None] = None,
+        data: Union[dict, str, bool, None] = None,
         headers: Optional[dict] = None,
         level: int = logging.DEBUG,
     ) -> None:
@@ -400,17 +422,28 @@ class AtlassianRestAPI(object):
         :return:
         """
         headers = headers or self.default_headers
-        message = "curl --silent -X {method} -H {headers} {data} '{url}'".format(
+        payload = None if data is None else (data if isinstance(data, str) else dumps(data))
+        message = "curl --show-error -X {method} -H {headers} {data} {url}".format(
             method=method,
-            headers=" -H ".join([f"'{key}: {value}'" for key, value in list(headers.items())]),
-            data="" if not data else f"--data '{dumps(data)}'",
-            url=url,
+            headers=" -H ".join(_curl_quote(f"{key}: {value}") for key, value in headers.items()),
+            data="" if payload is None else f"--data {_curl_quote(payload)}",
+            url=_curl_quote(url),
         )
         log.log(level=level, msg=message)
 
     def resource_url(
         self, resource: str, api_root: Optional[str] = None, api_version: Union[str, int, None] = None
     ) -> str:
+        """Build a relative REST resource URL from the configured API settings.
+
+        Args:
+            resource: Endpoint path below the API root and version.
+            api_root: Optional API root overriding the client default.
+            api_version: Optional API version overriding the client default.
+
+        Returns:
+            Normalized relative REST resource URL.
+        """
         if api_root is None:
             api_root = self.api_root
         if api_version is None:
@@ -419,19 +452,30 @@ class AtlassianRestAPI(object):
 
     @staticmethod
     def url_joiner(url: Optional[str], path: str, trailing: Optional[bool] = None) -> str:
+        """Join URL components without duplicate slashes.
+
+        Args:
+            url: Base URL or relative path.
+            path: Path to append.
+            trailing: Whether to add a trailing slash.
+
+        Returns:
+            Normalized joined URL.
+        """
         url_link = "/".join(str(s).strip("/") for s in [url, path] if s is not None)
         if trailing:
             url_link += "/"
         return url_link
 
     def close(self) -> None:
+        """Close the underlying HTTP session and release its connections."""
         return self._session.close()
 
     def request(
         self,
         method: str = "GET",
         path: str = "/",
-        data: Union[dict, str, None] = None,
+        data: Union[dict, str, bool, None] = None,
         json: Union[dict, str, None] = None,
         flags: Optional[list] = None,
         params: Optional[dict] = None,
@@ -465,29 +509,48 @@ class AtlassianRestAPI(object):
             else:
                 url += "?"
         if params:
-            url += urlencode((params or {}), safe=",")
+            url += urlencode((params or {}), safe=",", doseq=True)
         if flags:
             url += ("&" if params or params_already_in_url else "") + "&".join(flags or [])
         json_dump = None
         if files is None:
             data = None if data is None else dumps(data)
-            json_dump = None if not json else dumps(json)
+            json_dump = None if json is None else dumps(json)
 
         headers = headers or self.default_headers
 
+        # ``requests`` reads file-like multipart values when preparing a
+        # request. Reset them before every attempt so a retry cannot upload an
+        # already-consumed, zero-byte file.
+        file_positions = []
+        if files:
+            for upload in files.values():
+                stream = upload[1] if isinstance(upload, (tuple, list)) and len(upload) > 1 else upload
+                if hasattr(stream, "seek") and hasattr(stream, "tell"):
+                    try:
+                        file_positions.append((stream, stream.tell()))
+                    except (OSError, ValueError):
+                        pass
+
         retry_handler = self._retry_handler()
         while True:
+            for stream, position in file_positions:
+                stream.seek(position)
             self.log_curl_debug(
                 method=method,
                 url=url,
                 headers=headers,
-                data=data or json_dump,
+                data=data if data is not None else json_dump,
             )
+            # ``requests`` does not accept booleans as request bodies. The
+            # public client has historically accepted them, so preserve that
+            # convenience while sending a valid textual representation.
+            request_data = str(data).lower() if isinstance(data, bool) else data
             response = self._session.request(
                 method=method,
                 url=url,
                 headers=headers,
-                data=data,
+                data=request_data,
                 json=json,
                 timeout=self.timeout,
                 verify=self.verify_ssl,
@@ -798,7 +861,7 @@ class AtlassianRestAPI(object):
     def put(
         self,
         path: str,
-        data: Union[dict, str, None] = ...,
+        data: Union[dict, str, bool, None] = ...,
         headers: Optional[dict] = ...,
         files: Optional[dict] = ...,
         trailing: Optional[bool] = ...,
@@ -813,7 +876,7 @@ class AtlassianRestAPI(object):
     def put(
         self,
         path: str,
-        data: Union[dict, str, None] = ...,
+        data: Union[dict, str, bool, None] = ...,
         headers: Optional[dict] = ...,
         files: Optional[dict] = ...,
         trailing: Optional[bool] = ...,
@@ -828,7 +891,7 @@ class AtlassianRestAPI(object):
     def put(
         self,
         path: str,
-        data: Union[dict, str, None] = ...,
+        data: Union[dict, str, bool, None] = ...,
         headers: Optional[dict] = ...,
         files: Optional[dict] = ...,
         trailing: Optional[bool] = ...,
@@ -844,7 +907,7 @@ class AtlassianRestAPI(object):
     def put(
         self,
         path: str,
-        data: Union[dict, str, None] = ...,
+        data: Union[dict, str, bool, None] = ...,
         headers: Optional[dict] = ...,
         files: Optional[dict] = ...,
         trailing: Optional[bool] = ...,
@@ -857,7 +920,7 @@ class AtlassianRestAPI(object):
     def put(
         self,
         path: str,
-        data: Union[dict, str, None] = None,
+        data: Union[dict, str, bool, None] = None,
         headers: Optional[dict] = None,
         files: Optional[dict] = None,
         trailing: Optional[bool] = None,

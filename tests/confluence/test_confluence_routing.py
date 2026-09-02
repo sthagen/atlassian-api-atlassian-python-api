@@ -3,7 +3,10 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from atlassian.confluence import Confluence, ConfluenceCloud, ConfluenceServer
+from atlassian.confluence.cloud.cloud import ConfluenceCloud as V2ConfluenceCloud
 
 
 class TestConfluenceRouting:
@@ -33,10 +36,10 @@ class TestConfluenceRouting:
         mock_cloud.assert_called_once()
         mock_server.assert_not_called()
 
-    @patch.object(ConfluenceCloud, "__init__", return_value=None)
+    @patch.object(V2ConfluenceCloud, "__init__", return_value=None)
     @patch.object(ConfluenceServer, "__init__", return_value=None)
-    def test_api_gateway_routes_to_cloud(self, mock_server, mock_cloud):
-        """OAuth2 API gateway URL routes to Cloud."""
+    def test_api_gateway_routes_to_cloud_v2(self, mock_server, mock_cloud):
+        """Scoped-token API gateway URLs route to the v2 Cloud client."""
         Confluence("https://api.atlassian.com/ex/confluence/abc123")
         mock_cloud.assert_called_once()
         mock_server.assert_not_called()
@@ -64,3 +67,11 @@ class TestConfluenceRouting:
         Confluence("https://mysite.atlassian.net", cloud=False)
         mock_server.assert_called_once()
         mock_cloud.assert_not_called()
+
+    def test_legacy_cloud_api_version_is_normalized_to_cloud_flag(self):
+        """The historical api_version='cloud' spelling remains compatible."""
+        with pytest.warns(DeprecationWarning):
+            client = Confluence("https://confluence.example.test", api_version="cloud")
+
+        assert client._impl.cloud is True
+        assert client._impl.api_version == "2"

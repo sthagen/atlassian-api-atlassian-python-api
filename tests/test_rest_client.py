@@ -3,10 +3,13 @@
 Unit tests for atlassian.rest_client module
 """
 
+import io
+from base64 import b64decode
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from .mockup import mockup_server
 from atlassian.rest_client import AtlassianRestAPI
@@ -66,6 +69,94 @@ class TestAtlassianRestAPI:
         api = AtlassianRestAPI(url=f"{mockup_server()}/test", token="apitoken123")
         # The token should be stored in the session configuration
         assert hasattr(api, "session")
+
+    def test_token_authentication_is_not_overridden_by_netrc(self, monkeypatch):
+        api = AtlassianRestAPI(url="https://confluence.example.test", token="expected-token")
+        monkeypatch.setattr(requests.sessions, "get_netrc_auth", lambda *_args, **_kwargs: ("old", "credentials"))
+
+        prepared_request = api.session.prepare_request(requests.Request("GET", "https://confluence.example.test"))
+
+        assert prepared_request.headers["Authorization"] == "Bearer expected-token"
+        assert api.session.trust_env is True
+
+    def test_token_authentication_strips_file_line_endings(self):
+        api = AtlassianRestAPI(url="https://confluence.example.test", token="expected-token\r\n")
+
+        prepared_request = api.session.prepare_request(requests.Request("GET", "https://confluence.example.test"))
+
+        assert prepared_request.headers["Authorization"] == "Bearer expected-token"
+
+    def test_cloud_api_token_uses_basic_authentication(self):
+        api = AtlassianRestAPI(
+            url="https://confluence.example.test", username="you@example.test", password="cloud-api-token", cloud=True
+        )
+
+        prepared_request = api.session.prepare_request(requests.Request("GET", "https://confluence.example.test"))
+
+        scheme, encoded_credentials = prepared_request.headers["Authorization"].split(" ", 1)
+        assert scheme == "Basic"
+        assert b64decode(encoded_credentials).decode() == "you@example.test:cloud-api-token"
+
+    def test_log_curl_debug_does_not_double_encode_serialized_json(self, monkeypatch):
+        messages = []
+        monkeypatch.setattr("atlassian.rest_client.log.log", lambda **kwargs: messages.append(kwargs["msg"]))
+
+        self.api.log_curl_debug(
+            method="POST",
+            url="https://example.test/rest/api/content",
+            headers={"Content-Type": "application/json"},
+            data='{"body": {"storage": {"value": "example"}}}',
+        )
+
+        assert "curl --show-error -X POST" in messages[0]
+        assert '--data \'{"body": {"storage": {"value": "example"}}}\'' in messages[0]
+        assert '\\"body\\"' not in messages[0]
+
+    def test_request_logs_json_payload_once(self, monkeypatch):
+        captured = {}
+
+        def capture_curl_debug(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(self.api, "log_curl_debug", capture_curl_debug)
+        monkeypatch.setattr(
+            self.api._session,
+            "request",
+            lambda **_kwargs: SimpleNamespace(status_code=200, reason="OK", text="", encoding=None),
+        )
+        monkeypatch.setattr(self.api, "raise_for_status", lambda _response: None)
+
+        self.api.request("POST", "content", json={"title": "Page"}, advanced_mode=True)
+
+        assert captured["data"] == '{"title": "Page"}'
+
+    def test_request_encodes_sequence_query_parameters_as_repeated_values(self, monkeypatch):
+        captured = {}
+
+        def request(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(status_code=200, reason="OK", text="", encoding=None)
+
+        monkeypatch.setattr(self.api._session, "request", request)
+        monkeypatch.setattr(self.api, "raise_for_status", lambda _response: None)
+
+        self.api.request("GET", "tasks", params={"task-id": [1, 2]}, advanced_mode=True)
+
+        assert captured["url"].endswith("tasks?task-id=1&task-id=2")
+
+    def test_request_serializes_boolean_data_for_requests(self, monkeypatch):
+        captured = {}
+
+        def request(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(status_code=200, reason="OK", text="", encoding=None)
+
+        monkeypatch.setattr(self.api._session, "request", request)
+        monkeypatch.setattr(self.api, "raise_for_status", lambda _response: None)
+
+        self.api.request("POST", "content", data=True, advanced_mode=True)
+
+        assert captured["data"] == "true"
 
     def test_init_with_cert(self):
         """Test initialization with certificate"""
@@ -183,6 +274,37 @@ class TestAtlassianRestAPI:
         """Test advanced mode configuration"""
         api = AtlassianRestAPI(url=f"{mockup_server()}/test", advanced_mode=True)
         assert api.advanced_mode is True
+
+    def test_request_rewinds_uploaded_file_before_retry(self):
+        class RetryingSession:
+            def __init__(self):
+                self.verify = True
+                self.payloads = []
+                self.responses = [
+                    SimpleNamespace(status_code=503, headers={}, reason="Unavailable", text=""),
+                    SimpleNamespace(status_code=200, headers={}, reason="OK", text=""),
+                ]
+
+            def request(self, **kwargs):
+                self.payloads.append(kwargs["files"]["file"][1].read())
+                return self.responses.pop(0)
+
+        session = RetryingSession()
+        api = AtlassianRestAPI(
+            url="https://example.test",
+            session=session,
+            advanced_mode=True,
+            retry_status_codes=[503],
+            max_backoff_retries=1,
+            backoff_factor=0,
+            backoff_jitter=0,
+        )
+        api.backoff_and_retry = True
+        api.use_urllib3_retry = False
+
+        api.request("POST", "attachment", files={"file": ("report.csv", io.BytesIO(b"small report"))})
+
+        assert session.payloads == [b"small report", b"small report"]
 
     def test_kerberos_configuration(self):
         """Test kerberos configuration"""
@@ -394,6 +516,27 @@ class TestAtlassianRestAPI:
 
         assert handler(response) is True
         assert captured["delay"] == 5
+
+    def test_retry_handler_clamps_non_finite_retry_after(self, monkeypatch):
+        """Ensure non-finite Retry-After headers are clamped to max_backoff_seconds."""
+        captured = {}
+
+        def fake_sleep(delay):
+            captured["delay"] = delay
+
+        monkeypatch.setattr("atlassian.rest_client.time.sleep", fake_sleep)
+
+        api = AtlassianRestAPI(
+            url=f"{mockup_server()}/test",
+            retry_with_header=True,
+            max_backoff_seconds=7,
+        )
+
+        handler = api._retry_handler()
+        response = SimpleNamespace(headers={"Retry-After": "1e309"}, status_code=429)
+
+        assert handler(response) is True
+        assert captured["delay"] == 7
 
     def test_retry_handler_parses_http_date(self, monkeypatch):
         """Ensure HTTP-date Retry-After headers are converted to delta seconds."""

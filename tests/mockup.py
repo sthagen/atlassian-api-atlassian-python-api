@@ -1,10 +1,9 @@
 # coding: utf8
 import json
 import os
-
 from unittest.mock import Mock
 
-from requests import Session, Response
+from requests import Response, Session
 
 SERVER = "https://my.test.server.com"
 RESPONSE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "responses")
@@ -58,7 +57,14 @@ def request_mockup(*args, **kwargs):
                 response._content = bytes(json.dumps(data), response.encoding)
             else:
                 response.status_code = 200
-                response._content = data
+                response.encoding = "utf-8"
+                if isinstance(data, bytes):
+                    response._content = data
+                else:
+                    # REST endpoints may legitimately return a JSON list or
+                    # scalar, not only an object. Serialize every non-byte
+                    # fixture so requests.Response.text can decode it.
+                    response._content = json.dumps(data).encode(response.encoding)
     except FileNotFoundError:
         response.encoding = "utf-8"
         response._content = b"{}"

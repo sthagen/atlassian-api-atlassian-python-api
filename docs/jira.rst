@@ -47,6 +47,43 @@ Reindex Jira
                             If it's not possible (due to an inconsistent index), do a foreground reindexing.
     """
 
+Workflow transition rule configurations (Server/Data Center)
+------------------------------------------------------------
+
+Jira Server 8.13 and compatible Data Center releases expose transition-rule
+configuration through the v2 REST route.  Use the explicit Server client; the
+Cloud client has a separate implementation and authorization model.
+
+.. code-block:: python
+
+    from atlassian.jira import JiraServer
+
+    jira = JiraServer("https://jira.example.com", token="personal-access-token")
+    rules = jira.get_workflow_transition_rule_configurations(
+        types=["postfunction", "validator"],
+        workflow_names="Release workflow",
+        draft=False,
+    )
+
+    for workflow in rules["values"]:
+        print(workflow)
+
+Bulk issue retrieval
+--------------------
+
+``bulk_issue`` follows Jira search pages by default, so long issue-key lists
+are not silently limited by the server's configured page size.  Set
+``fetch_all=False`` to receive only the first REST response.
+
+.. code-block:: python
+
+    result, invalid_keys = jira.bulk_issue(
+        ["DEMO-1", "DEMO-2", "DEMO-3"],
+        fields=["summary", "status"],
+    )
+    for issue in result["issues"]:
+        print(issue["key"])
+
 Manage Permissions
 ------------------
 
@@ -71,6 +108,24 @@ Application properties
 
     # Returns the properties that are displayed on the "General Configuration > Advanced Settings" page.
     jira.get_advanced_settings()
+
+Application roles
+-----------------
+
+.. code-block:: python
+
+    # List every application role. Jira Server returns an ETag header that can
+    # be supplied to the update call as ``if_match``.
+    roles = jira.get_all_application_roles()
+
+    # Retrieve an individual role.
+    jira.get_application_role("jira-software")
+
+    # Update only groups/defaultGroups. The role key/name cannot be changed.
+    jira.update_application_roles(
+        [{"key": "jira-software", "groups": ["jira-software-users"]}],
+        if_match='"application-role-etag"',
+    )
 
 Manage users
 ------------
@@ -179,8 +234,23 @@ Manage projects
     # Results can be filtered by the following fields: query, status.
     jira.get_project_versions_paginated(key, start=None, limit=None, order_by=None, expand=None, query=None, status=None)
 
-    # Add missing version to project
-    jira.add_version(key, project_id, version, is_archived=False, is_released=False)
+    # Add a version to a Jira Server/Data Center project
+    jira.add_version(
+        project_key=key,
+        project_id=project_id,
+        version={
+            "name": "TestVersion",
+            "description": "Just a test description",
+            "released": False,
+            "archived": False,
+        },
+    )
+
+    # Jira Cloud requires the numeric project ID and uses REST v3
+    jira.add_version(
+        project_id=10000,
+        version={"name": "TestVersion", "description": "Just a test description"},
+    )
 
     # Update an existing version
     jira.update_version(version, name=None, description=None, is_archived=None, is_released=None, start_date=None, release_date=None)
@@ -212,6 +282,10 @@ Manage projects
     # Get project permission scheme
     # Use 'expand' to get details (default is None)
     jira.get_project_permission_scheme(project_id_or_key, expand='permissions,user,group,projectRole,field,all')
+
+    # Assign a permission scheme. On Jira Cloud this uses the v3 JSON endpoint;
+    # the caller needs the Administer Jira global permission.
+    jira.assign_project_permission_scheme(project_id_or_key, permission_scheme_id)
 
     # Get the issue security scheme for project.
     # Returned if the user has the administrator permission or if the scheme is used in a project in which the
@@ -577,10 +651,24 @@ Attachments actions
     # Add attachment (IO Object) to issue
     jira.add_attachment_object(issue_key, attachment)
 
-    # Download attachments from the issue
-    jira.download_attachments_from_issue(issue, path=None, cloud=True):
+    # Gets the binary raw data of single attachment in bytes.
+    jira.get_attachment_content(attachment_id)
 
-    # Get list of attachments ids from issue
+    # Download attachments from the issue
+    # For both methods, if path is None, current working directory is used.
+    # zip file name is in following format: "<issue id>_attachments.zip"
+
+    # This method downloads zip file compressed from Jira server side.
+    # Best when total attachment size is less than 1 GB.
+    # Returns a message indicating the result of the download operation.
+    jira.download_issue_attachments(issue_key, path=None, overwrite=False)
+
+    # This method downloads individual files and compresses zip file locally.
+    # Best when total attachment size is greater than 1 GB.
+    # Returns the file path of created zip file.
+    jira.get_all_attachment_contents(issue_key, path=None, overwrite=False)
+
+    # Get list of attachment names and ids from issue
     jira.get_attachments_ids_from_issue(issue_key)
 
 Manage components

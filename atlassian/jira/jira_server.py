@@ -1,7 +1,10 @@
 # coding=utf-8
+# Jira Server/Data Center compatibility implementation.
 import logging
 import os
 import re
+import zipfile
+from json import dumps
 from typing import Any, BinaryIO, Dict, List, Optional, Union, cast
 from warnings import warn
 
@@ -13,9 +16,9 @@ if sys.version_info >= (3, 8):
     from typing import Literal  # Python 3.8+
 else:
     from typing_extensions import Literal  # Python <=3.7
-from .errors import ApiNotFoundError, ApiPermissionError
-from .rest_client import AtlassianRestAPI
-from .typehints import T_id, T_resp_json, copy_type
+from ..errors import ApiNotFoundError, ApiPermissionError
+from ..rest_client import AtlassianRestAPI
+from ..typehints import T_id, T_resp_json, copy_type
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +232,30 @@ class Jira(AtlassianRestAPI):
         url = f"{base_url}/{role_key}"
         return self.get(url) or {}
 
+    def update_application_roles(
+        self, application_roles: List[Dict[str, Any]], if_match: Optional[str] = None
+    ) -> T_resp_json:
+        """Update groups and default groups for Jira Server application roles.
+
+        Jira updates only the ``groups`` and ``defaultGroups`` properties. Use
+        the optional ETag returned by :meth:`get_all_application_roles` through
+        ``if_match`` to avoid overwriting a newer role configuration.
+
+        Args:
+            application_roles: Roles to update, each including its ``key`` and
+                permitted mutable properties.
+            if_match: Optional ApplicationRole collection ETag for optimistic
+                concurrency control.
+
+        Returns:
+            Updated ApplicationRole collection.
+        """
+        url = self.resource_url("applicationrole")
+        headers = dict(self.default_headers)
+        if if_match is not None:
+            headers["If-Match"] = if_match
+        return self.put(url, data=dumps(application_roles), headers=headers)
+
     """
     Attachments
     Reference: https://docs.atlassian.com/software/jira/docs/api/REST/8.5.0/#api/2/attachment
@@ -258,7 +285,7 @@ class Jira(AtlassianRestAPI):
 
     def download_issue_attachments(
         self,
-        issue: str,
+        issue: T_id,
         path: Optional[str] = None,
         overwrite: bool = False,
         stream: bool = False,
@@ -267,6 +294,8 @@ class Jira(AtlassianRestAPI):
     ) -> Optional[str]:
         """
         Downloads all attachments from a Jira issue.
+        This method downloads zip file compressed from Jira server side, and may fail if total attachment size is too large.
+        Use `get_all_attachment_contents()` to download individual attachments and zip from client side.
         :param issue: The issue-key of the Jira issue
         :param path: Path to directory where attachments will be saved. If None, current working directory will be used.
         :param overwrite: If True, always download and create new zip file.
@@ -378,6 +407,61 @@ class Jira(AtlassianRestAPI):
             absolute=True,
             headers={"Accept": "*/*"},
         )
+
+    def get_all_attachment_contents(
+        self,
+        issue: T_id,
+        path: Optional[str] = None,
+        overwrite: bool = False,
+        compression: int = zipfile.ZIP_STORED,
+    ) -> Optional[str]:
+        """
+        Downloads all attachments from a Jira issue by downloading individual files and creating zip file.
+        This method is useful when total attachment size is too large for Jira server to compress as single file.
+        If total attachment size is small enough, using `download_issue_attachments()` may be more efficient.
+        :param issue: The issue-key of the Jira issue
+        :param path: Path to directory where attachments will be saved. If None, current working directory will be used.
+        :param overwrite: If True, always download and create new zip file.
+                          If False (default), download will be skipped when zip file already exists in path.
+        :param compression: Compression method for zipfile. Should be one of the constants listed in documentation page.
+                            https://docs.python.org/3/library/zipfile.html#zipfile.ZipFile
+        :return: File path of the zip file if file is existing or download is successful. None if attachment does not exist.
+        """
+        try:
+            if path is None:
+                path = os.getcwd()
+            issue_data = self.issue(issue, fields="id,attachment")
+            issue_id = issue_data["id"]
+            attachment_name = f"{issue_id}_attachments.zip"
+            file_path = os.path.join(path, attachment_name)
+            if not overwrite and os.path.isfile(file_path):
+                return file_path
+
+            attachments_metadata = issue_data["fields"]["attachment"]
+            if not attachments_metadata:
+                return None
+
+            with zipfile.ZipFile(file_path, "w", compression=compression) as file:
+                for meta in attachments_metadata:
+                    # stream download should not be used, as writestr expects full content with filename.
+                    content = self.get(
+                        meta["content"],
+                        not_json_response=True,
+                        absolute=True,
+                        headers={"Accept": "*/*"},
+                    )
+                    file.writestr(meta["filename"], content)
+
+            return file_path
+
+        except FileNotFoundError:
+            raise FileNotFoundError("Verify if directory path is correct and/or if directory exists")
+        except PermissionError:
+            raise PermissionError(
+                "Directory found, but there is a problem with saving file to this directory. Check directory permissions"
+            )
+        except Exception as e:
+            raise e
 
     def remove_attachment(self, attachment_id: T_id) -> T_resp_json:
         """
@@ -708,6 +792,14 @@ class Jira(AtlassianRestAPI):
     """
 
     def component(self, component_id: T_id) -> T_resp_json:
+        """Perform the Jira component operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("component")
         return self.get(f"{base_url}/{component_id}")
 
@@ -722,22 +814,54 @@ class Jira(AtlassianRestAPI):
         return self.get(url)
 
     def create_component(self, component: dict) -> T_resp_json:
+        """Perform the Jira create component operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         log.info('Creating component "%s"', component["name"])
         base_url = self.resource_url("component")
         url = f"{base_url}/"
         return self.post(url, data=component)
 
     def update_component(self, component: dict, component_id: T_id) -> T_resp_json:
+        """Perform the Jira update component operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("component")
         url = f"{base_url}/{component_id}"
         return self.put(url, data=component)
 
     def delete_component(self, component_id: T_id) -> T_resp_json:
+        """Perform the Jira delete component operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         log.info('Deleting component "%s"', component_id)
         base_url = self.resource_url("component")
         return self.delete(f"{base_url}/{component_id}")
 
     def update_component_lead(self, component_id: T_id, lead: str) -> T_resp_json:
+        """Perform the Jira update component lead operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         data = {"id": component_id, "leadUserName": lead}
         base_url = self.resource_url("component")
         return self.put(
@@ -834,7 +958,8 @@ class Jira(AtlassianRestAPI):
         """
         Get custom fields. Evaluated on 7.12
         Get fields paginated in cloud
-        :param search: str
+        :param search: str. For Jira Cloud this is sent as the API's ``query``
+            parameter; Jira Server/Data Center continues to use ``search``.
         :param start: long Default: 1
         :param limit: int Default: 50
         :return:
@@ -845,7 +970,7 @@ class Jira(AtlassianRestAPI):
             url = self.resource_url("customFields")
         params: dict = {}
         if search:
-            params["search"] = search
+            params["query" if self.cloud else "search"] = search
         if start:
             params["startAt"] = start
         if limit:
@@ -857,7 +982,9 @@ class Jira(AtlassianRestAPI):
         Returns a list of all fields, both System and Custom
         :return: application/jsonContains a full representation of all visible fields in JSON.
         """
-        url = self.resource_url("field")
+        # Jira Cloud's v3 field resource is the current endpoint and includes
+        # custom fields visible to the caller. Keep Server/Data Center on v2.
+        url = self.resource_url("field", api_version=3 if self.cloud else None)
         return self.get(url)
 
     def create_custom_field(
@@ -1290,6 +1417,14 @@ class Jira(AtlassianRestAPI):
     """
 
     def issue(self, key: T_id, fields: Union[str, dict] = "*all", expand: Optional[str] = None):
+        """Perform the Jira issue operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{key}?fields={fields}"
         params: dict = {}
@@ -1350,27 +1485,81 @@ class Jira(AtlassianRestAPI):
             params["expand"] = expand
         return self.get(url, params=params)
 
-    def bulk_issue(self, issue_list: list, fields: Union[str, list] = "*all"):
-        """
-        :param fields:
-        :param list issue_list:
-        :return:
+    def bulk_issue(
+        self,
+        issue_list: list,
+        fields: Union[str, list] = "*all",
+        start: int = 0,
+        limit: Optional[int] = None,
+        fetch_all: bool = True,
+    ):
+        """Return issues matching the supplied issue keys.
+
+        Jira applies a maximum page size to search results.  By default this
+        method follows every page and returns all matching issues in the
+        response's ``issues`` list.  Set ``fetch_all`` to ``False`` to retain
+        the single-page REST response.
+
+        :param issue_list: Issue keys to retrieve.
+        :param fields: Fields to return for each issue.
+        :param start: First Server/Data Center result offset.
+        :param limit: Requested page size; Jira may apply a lower system limit.
+        :param fetch_all: Whether to collect all available result pages.
+        :return: A tuple of the Jira search response and issue keys reported
+            as invalid by Jira.
         """
         jira_issue_regex = re.compile(r"\w+-\d+")
-        missing_issues = list()
-        matched_issue_keys = list()
+        missing_issues = []
+        matched_issue_keys = []
         for key in issue_list:
             if re.match(jira_issue_regex, key):
                 matched_issue_keys.append(key)
-        jql = f"key in ({', '.join(set(matched_issue_keys))})"
-        query_result = self.jql(jql, fields=fields)
+        jql = f"key in ({', '.join(dict.fromkeys(matched_issue_keys))})"
+        if self.cloud:
+            if start:
+                raise ValueError("Jira Cloud does not support offset pagination; use enhanced_jql instead.")
+            query_result = self.enhanced_jql(jql, fields=fields, limit=limit)
+        else:
+            query_result = self.jql(jql, fields=fields, start=start, limit=limit)
+
         if query_result and "errorMessages" in list(query_result.keys()):
             for message in query_result["errorMessages"]:
                 for key in issue_list:
                     if key in message:
                         missing_issues.append(key)
-                        issue_list.remove(key)
-            query_result, missing_issues = self.bulk_issue(issue_list, fields)
+            remaining_issues = [key for key in issue_list if key not in missing_issues]
+            if remaining_issues != issue_list:
+                query_result, nested_missing_issues = self.bulk_issue(
+                    remaining_issues, fields, start=start, limit=limit, fetch_all=fetch_all
+                )
+                missing_issues.extend(nested_missing_issues)
+            return query_result, missing_issues
+
+        if not fetch_all or not query_result:
+            return query_result, missing_issues
+
+        issues = list(query_result.get("issues", []))
+        if self.cloud:
+            next_page_token = query_result.get("nextPageToken")
+            while not query_result.get("isLast", True) and next_page_token:
+                query_result = self.enhanced_jql(jql, fields=fields, nextPageToken=next_page_token, limit=limit)
+                issues.extend(query_result.get("issues", []))
+                next_page_token = query_result.get("nextPageToken")
+        else:
+            next_start = start + len(issues)
+            total = query_result.get("total")
+            while issues and (total is None or next_start < total):
+                page = self.jql(jql, fields=fields, start=next_start, limit=limit)
+                if not page:
+                    break
+                page_issues = page.get("issues", [])
+                if not page_issues:
+                    break
+                issues.extend(page_issues)
+                next_start += len(page_issues)
+                total = page.get("total", total)
+
+        query_result["issues"] = issues
         return query_result, missing_issues
 
     def issue_createmeta(self, project: str, expand: str = "projects.issuetypes.fields") -> T_resp_json:
@@ -1432,6 +1621,14 @@ class Jira(AtlassianRestAPI):
         return self.get(url, params=params)
 
     def issue_editmeta(self, key: str):
+        """Perform the Jira issue editmeta operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{key}/editmeta"
         return self.get(url)
@@ -1554,12 +1751,28 @@ class Jira(AtlassianRestAPI):
         return self.put(url)
 
     def issue_field_value(self, key: str, field: str):
+        """Perform the Jira issue field value operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         issue = self.get(f"{base_url}/{key}?fields={field}")
         if issue:
             return issue["fields"][field]
 
     def issue_fields(self, key: str):
+        """Perform the Jira issue fields operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         issue = self.get(f"{base_url}/{key}")
         if issue:
@@ -1693,6 +1906,14 @@ class Jira(AtlassianRestAPI):
         return self.post(url, headers=self.no_check_headers, files=files)
 
     def issue_exists(self, issue_key: str) -> Optional[bool]:
+        """Perform the Jira issue exists operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         original_value = self.advanced_mode
         self.advanced_mode = True
         try:
@@ -1707,6 +1928,14 @@ class Jira(AtlassianRestAPI):
             self.advanced_mode = original_value
 
     def issue_deleted(self, issue_key: str) -> bool:
+        """Perform the Jira issue deleted operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         exists = self.issue_exists(issue_key)
         if exists:
             log.info('Issue "%s" is not deleted', issue_key)
@@ -1912,11 +2141,27 @@ class Jira(AtlassianRestAPI):
 
     # @todo refactor and merge with create_issue method
     def issue_create(self, fields: dict):
+        """Perform the Jira issue create operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         log.info('Creating issue "%s"', fields["summary"])
         url = self.resource_url("issue")
         return self.post(url, data={"fields": fields})
 
     def issue_create_or_update(self, fields: dict):
+        """Perform the Jira issue create or update operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         issue_key = fields.get("issuekey", None)
 
         if not issue_key or not self.issue_exists(issue_key):
@@ -2140,6 +2385,14 @@ class Jira(AtlassianRestAPI):
         return self.post(url, data=data)
 
     def get_issue_remote_link_by_id(self, issue_key: str, link_id: T_id):
+        """Perform the Jira get issue remote link by id operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}/remotelink/{link_id}"
         return self.get(url)
@@ -2183,6 +2436,14 @@ class Jira(AtlassianRestAPI):
         return self.delete(url)
 
     def get_issue_transitions(self, issue_key: str) -> List[dict]:
+        """Perform the Jira get issue transitions operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         if self.advanced_mode:
             resp = cast("Response", self.get_issue_transitions_full(issue_key))
             d: Dict[str, list] = resp.json() or {}
@@ -2199,6 +2460,14 @@ class Jira(AtlassianRestAPI):
         ]
 
     def issue_transition(self, issue_key: str, status: str) -> T_resp_json:
+        """Perform the Jira issue transition operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.set_issue_status(issue_key, status)
 
     def set_issue_status(
@@ -2229,6 +2498,14 @@ class Jira(AtlassianRestAPI):
 
     def get_issue_status_changelog(self, issue_id: T_id):
         # Get the issue details with changelog
+        """Perform the Jira get issue status changelog operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         response_get_issue = self.get_issue(issue_id, fields="id", expand="changelog")
         status_change_history = []
         for history in response_get_issue["changelog"]["histories"]:
@@ -2262,12 +2539,28 @@ class Jira(AtlassianRestAPI):
         return self.post(url, data={"transition": {"name": transition_name}})
 
     def get_issue_status(self, issue_key: str):
+        """Perform the Jira get issue status operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}?fields=status"
         fields = [("fields",), ("status",), ("name",)]
         return self._get_response_content(url, fields=fields) or {}
 
     def get_issue_status_id(self, issue_key: str) -> str:
+        """Perform the Jira get issue status id operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}?fields=status"
         fields = [("fields",), ("status",), ("id",)]
@@ -2308,16 +2601,40 @@ class Jira(AtlassianRestAPI):
         return self.get(url)
 
     def set_issue_property(self, issue_key: str, property_key: str, data: dict):
+        """Perform the Jira set issue property operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}/properties/{property_key}"
         return self.put(url, data=data)
 
     def get_issue_property(self, issue_key: str, property_key: str):
+        """Perform the Jira get issue property operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}/properties/{property_key}"
         return self.get(url)
 
     def delete_issue_property(self, issue_key: str, property_key: str):
+        """Perform the Jira delete issue property operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("issue")
         url = f"{base_url}/{issue_key}/properties/{property_key}"
         return self.delete(url)
@@ -2774,6 +3091,14 @@ class Jira(AtlassianRestAPI):
         return self.get(url, params=params)
 
     def get_all_projects(self, included_archived: Optional[bool] = None, expand: Optional[str] = None):
+        """Perform the Jira get all projects operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.projects(included_archived, expand)
 
     def projects(self, included_archived: Optional[bool] = None, expand: Optional[str] = None):
@@ -2963,29 +3288,57 @@ class Jira(AtlassianRestAPI):
 
     def add_version(
         self,
-        project_key: str,
-        project_id: T_id,
-        version: str,
+        project_key: Optional[str] = None,
+        project_id: Optional[T_id] = None,
+        version: Optional[Union[str, dict]] = None,
         is_archived: bool = False,
         is_released: bool = False,
     ):
         """
-        Add missing version to project
-        :param project_key: the project key
-        :param project_id: the project id
-        :param version: the new project version to add
+        Add a version to a project on Jira Cloud or Server/Data Center.
+
+        ``version`` may be a name (the legacy form) or a complete version
+        payload.  Passing a payload is useful when setting description and
+        release dates. Cloud uses REST v3 and requires ``projectId``; Server
+        and Data Center use REST v2 and accept the project key and/or ID.
+
+        :param project_key: Project key, used by Server/Data Center.
+        :param project_id: Numeric project ID, required by Cloud.
+        :param version: Version name or a version payload dictionary.
         :param is_archived:
         :param is_released:
         :return:
         """
-        payload = {
-            "name": version,
-            "archived": is_archived,
-            "released": is_released,
-            "project": project_key,
-            "projectId": project_id,
-        }
-        url = self.resource_url("version")
+        if version is None:
+            raise ValueError("version must be a version name or payload dictionary")
+        if isinstance(version, dict):
+            payload = dict(version)
+        else:
+            payload = {"name": version, "archived": is_archived, "released": is_released}
+
+        if self.cloud:
+            if "projectId" not in payload:
+                if project_id is None:
+                    raise ValueError("project_id is required when creating a Jira Cloud version")
+                try:
+                    payload["projectId"] = int(project_id)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("project_id must be a numeric Jira Cloud project ID") from error
+        else:
+            if project_key is not None and "project" not in payload:
+                payload["project"] = project_key
+            if project_id is not None and "projectId" not in payload:
+                try:
+                    payload["projectId"] = int(project_id)
+                except (TypeError, ValueError):
+                    # Server accepts a project key in ``project``.  Older
+                    # callers often passed that same key as both arguments;
+                    # do not send it as the numeric projectId field.
+                    if project_key is None:
+                        raise ValueError("project_id must be numeric when project_key is not provided")
+
+        api_version = 3 if self.cloud else self.api_version
+        url = self.resource_url("version", api_version=api_version)
         return self.post(url, data=payload)
 
     def delete_version(self, version: str, moved_fixed: Optional[str] = None, move_affected: Optional[str] = None):
@@ -3110,6 +3463,16 @@ class Jira(AtlassianRestAPI):
         :return:
         """
         return self.add_project_actor_in_role(project_key, role_id, user_name, "atlassian-user-role-actor")
+
+    def add_group_into_project_role(self, project_key: str, role_id: T_id, group_name: str):
+        """
+
+        :param project_key:
+        :param role_id:
+        :param group_name:
+        :return:
+        """
+        return self.add_project_actor_in_role(project_key, role_id, group_name, "atlassian-group-role-actor")
 
     def add_project_actor_in_role(self, project_key: str, role_id: T_id, actor: str, actor_type: str):
         """
@@ -3266,14 +3629,25 @@ class Jira(AtlassianRestAPI):
 
     def assign_project_permission_scheme(self, project_id_or_key: str, permission_scheme_id: T_id):
         """
-        Assigns a permission scheme with a project.
-        :param project_id_or_key:
-        :param permission_scheme_id:
-        :return:
+        Assign a permission scheme to a project.
+
+        Jira Cloud requires the v3 endpoint and a JSON request body. Server and
+        Data Center continue to use their established v2-compatible endpoint.
+
+        :param project_id_or_key: Project key or numeric project ID.
+        :param permission_scheme_id: Numeric permission scheme ID.
+        :return: Updated project permission scheme.
         """
+        data = {"id": permission_scheme_id}
+        if self.cloud:
+            url = self.resource_url("project/{}/permissionscheme".format(project_id_or_key), api_version="3")
+            response = self.request("PUT", path=url, json=data)
+            if self.advanced_mode:
+                return response
+            return self._response_handler(response)
+
         base_url = self.resource_url("project")
         url = f"{base_url}/{project_id_or_key}/permissionscheme"
-        data = {"id": permission_scheme_id}
         return self.put(url, data=data)
 
     def get_project_permission_scheme(self, project_id_or_key: str, expand: Optional[str] = None):
@@ -3341,6 +3715,14 @@ class Jira(AtlassianRestAPI):
         return custom_fields
 
     def project_leaders(self):
+        """Perform the Jira project leaders operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         for project in self.projects():
             key = project["key"]
             project_data = self.project(key)
@@ -3354,6 +3736,14 @@ class Jira(AtlassianRestAPI):
             }
 
     def get_project_issuekey_last(self, project: str):
+        """Perform the Jira get project issuekey last operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         jql = f'project = "{project}" ORDER BY issuekey DESC'
         response = self.jql(jql)
         if self.advanced_mode:
@@ -3364,6 +3754,14 @@ class Jira(AtlassianRestAPI):
     def get_project_issuekey_all(
         self, project: str, start: int = 0, limit: Optional[int] = None, expand: Optional[str] = None
     ):
+        """Perform the Jira get project issuekey all operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         jql = f'project = "{project}" ORDER BY issuekey ASC'
         response = self.jql(jql, start=start, limit=limit, expand=expand)
         if self.advanced_mode:
@@ -3371,6 +3769,14 @@ class Jira(AtlassianRestAPI):
         return [issue["key"] for issue in cast("dict", response)["issues"]]
 
     def get_project_issues_count(self, project: str):
+        """Perform the Jira get project issues count operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         jql = f'project = "{project}" '
         response = self.jql(jql, fields="*none")
         if self.advanced_mode:
@@ -3426,11 +3832,27 @@ class Jira(AtlassianRestAPI):
         return self.get(url)
 
     def get_status_id_from_name(self, status_name: str):
+        """Perform the Jira get status id from name operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("status")
         url = f"{base_url}/{status_name}"
         return int(self._get_response_content(url, fields=[("id",)]))
 
     def get_status_for_project(self, project_key: str) -> T_resp_json:
+        """Perform the Jira get status for project operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         base_url = self.resource_url("project")
         url = f"{base_url}/{project_key}/statuses"
         return self.get(url)
@@ -3460,6 +3882,14 @@ class Jira(AtlassianRestAPI):
         return self.get(url)
 
     def get_transition_id_to_status_name(self, issue_key: str, status_name: str) -> Optional[int]:
+        """Perform the Jira get transition id to status name operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         for transition in self.get_issue_transitions(issue_key):
             if status_name.lower() == transition["to"].lower():
                 return int(transition["id"])
@@ -3789,7 +4219,10 @@ class Jira(AtlassianRestAPI):
             params["jql"] = jql
         if expand is not None:
             params["expand"] = expand
-        url = self.resource_url("search/jql")
+        # Enhanced JQL is only available at Jira Cloud REST API v3. The
+        # legacy-compatible Jira client defaults to v2, so it must not use its
+        # configured API version here.
+        url = self.resource_url("search/jql", api_version=3)
         return self.get(url, params=params)
 
     def approximate_issue_count(
@@ -3947,7 +4380,7 @@ class Jira(AtlassianRestAPI):
         if expand is not None:
             params["expand"] = expand
 
-        url = self.resource_url("search/jql")
+        url = self.resource_url("search/jql", api_version=3)
         results = []
         next_page_token = None
 
@@ -4150,6 +4583,47 @@ class Jira(AtlassianRestAPI):
         url = self.resource_url("workflow")
         return self.get(url)
 
+    def get_workflow_transition_rule_configurations(
+        self,
+        start_at: Optional[int] = None,
+        max_results: Optional[int] = None,
+        types: Optional[Union[str, List[str]]] = None,
+        keys: Optional[Union[str, List[str]]] = None,
+        workflow_names: Optional[Union[str, List[str]]] = None,
+        with_tags: Optional[bool] = None,
+        draft: Optional[bool] = None,
+        expand: Optional[str] = None,
+    ) -> T_resp_json:
+        """Return transition-rule configurations from Jira Server/Data Center.
+
+        Jira Server 8.13 and compatible Data Center releases expose this
+        resource at the v2 route.  The returned rules are limited to those
+        visible to the authenticated app or user.
+
+        :param start_at: Index of the first configuration to return.
+        :param max_results: Maximum configurations to return.
+        :param types: A rule type, or a list of rule types.
+        :param keys: A rule key, or a list of rule keys.
+        :param workflow_names: A workflow name, or a list of workflow names.
+        :param with_tags: Include rule tags when supported by the server.
+        :param draft: Whether to read rules from draft workflows.
+        :param expand: Additional fields to expand in the response.
+        :return: Jira's paginated transition-rule configuration response.
+        """
+        url = self.resource_url("workflow/rule/config")
+        params = {
+            "startAt": start_at,
+            "maxResults": max_results,
+            "types": types,
+            "keys": keys,
+            "workflowNames": workflow_names,
+            "withTags": with_tags,
+            "draft": draft,
+            "expand": expand,
+        }
+        params = {key: value for key, value in params.items() if value is not None}
+        return self.get(url, params=params or None)
+
     def get_workflows_paginated(
         self,
         start_at: Optional[int] = None,
@@ -4240,6 +4714,14 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return self.delete(url)
 
     def check_plugin_manager_status(self) -> Response:
+        """Perform the Jira check plugin manager status operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         url = "rest/plugins/latest/safe-mode"
         return self.request(method="GET", path=url, headers=self.safe_mode_headers)
 
@@ -4703,6 +5185,14 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return response.json()
 
     def reindex_project(self, project_key: str) -> T_resp_json:
+        """Perform the Jira reindex project operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.post(
             "secure/admin/IndexProject.jspa",
             data=f"confirmed=true&key={project_key}",
@@ -5176,6 +5666,14 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return self.get(url, params=params)
 
     def tempo_timesheets_approval_status(self, period_start_date: str, user_name: str) -> T_resp_json:
+        """Perform the Jira tempo timesheets approval status operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         url = "rest/tempo-timesheets/4/timesheet-approval/approval-statuses"
         params: dict = {}
         if user_name:
@@ -5203,6 +5701,14 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return self.get(url)
 
     def tempo_teams_get_all_teams(self, expand: Optional[str] = None) -> T_resp_json:
+        """Perform the Jira tempo teams get all teams operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         url = "rest/tempo-teams/2/team"
         params: dict = {}
         if expand:
@@ -5284,12 +5790,36 @@ api-group-workflows/#api-rest-api-2-workflow-search-get)
         return self.put(url, data=data)
 
     def tempo_timesheets_get_period_configuration(self) -> T_resp_json:
+        """Perform the Jira tempo timesheets get period configuration operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.get("rest/tempo-timesheets/3/period-configuration")
 
     def tempo_timesheets_get_private_configuration(self) -> T_resp_json:
+        """Perform the Jira tempo timesheets get private configuration operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.get("rest/tempo-timesheets/3/private/config")
 
     def tempo_teams_get_memberships_for_member(self, username: str) -> T_resp_json:
+        """Perform the Jira tempo teams get memberships for member operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Jira REST response.
+        """
         return self.get(f"rest/tempo-teams/2/user/{username}/memberships")
 
     #######################################################################

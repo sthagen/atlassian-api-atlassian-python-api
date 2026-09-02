@@ -1,8 +1,7 @@
 # coding=utf-8
 import logging
 
-from atlassian import Confluence
-from atlassian import Jira
+from atlassian import Confluence, Jira
 
 logging.basicConfig(level=logging.DEBUG, format="[%(asctime).19s] [%(levelname)s] %(message)s")
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -12,13 +11,15 @@ jira = Jira(url="http://localhost:8080", username="admin", password="admin")
 
 confluence = Confluence(url="http://localhost:8090", username="admin", password="admin")
 
-html = ["""<table>
+html = [
+    """<table>
                 <tr>
                     <th>Project Key</th>
                     <th>Project Name</th>
                     <th>Leader</th>
                     <th>Email</th>
-                </tr>"""]
+                </tr>"""
+]
 
 for data in jira.project_leaders():
     log.info("{project_key} leader is {lead_name} <{lead_email}>".format(**data))

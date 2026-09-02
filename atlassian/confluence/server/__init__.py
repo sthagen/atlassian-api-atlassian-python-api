@@ -7,7 +7,8 @@ import re
 import sys
 import time
 import warnings
-from typing import cast
+from typing import Optional, cast
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,6 +26,7 @@ from atlassian.errors import (
     JsonRPCError,
     JsonRPCRestrictionsError,
 )
+from .confluence_server import ConfluenceServer  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +42,25 @@ class Server(ConfluenceServerBase):
     Confluence Server REST API wrapper
     """
 
+    _api_resources = frozenset(
+        {
+            "accessmode",
+            "admin",
+            "audit",
+            "content",
+            "contentbody",
+            "group",
+            "health",
+            "longtask",
+            "metadata",
+            "reindex",
+            "search",
+            "space",
+            "template",
+            "user",
+        }
+    )
+
     content_types = {
         ".gif": "image/gif",
         ".png": "image/png",
@@ -52,15 +73,67 @@ class Server(ConfluenceServerBase):
     }
 
     def __init__(self, url, *args, **kwargs):
+        api_version_is_explicit = "api_version" in kwargs
         # Set default values only if not provided
         if "cloud" not in kwargs:
             kwargs["cloud"] = False
         if "api_version" not in kwargs:
-            kwargs["api_version"] = "1.0"
+            # Confluence Data Center no longer guarantees the legacy 1.0
+            # route.  An unversioned REST path is resolved by the server to
+            # its supported/latest API version.
+            kwargs["api_version"] = "latest"
         if "api_root" not in kwargs:
             kwargs["api_root"] = "rest/api"
-        url = url.strip("/") + f"/{kwargs['api_root']}/{kwargs['api_version']}"
-        super(Server, self).__init__(url, *args, **kwargs)
+        super(Server, self).__init__(url.rstrip("/"), *args, **kwargs)
+        self._api_version_is_explicit = api_version_is_explicit
+
+    def _server_api_path(self, path):
+        """Prefix unrooted Server REST resources without changing legacy paths."""
+        if not isinstance(path, str):
+            return path
+
+        normalized_path = path.lstrip("/")
+        resource = normalized_path.split("/", 1)[0].split("?", 1)[0]
+        if resource not in self._api_resources:
+            return path
+
+        api_parts = [self.api_root]
+        if self._api_version_is_explicit:
+            api_parts.append(self.api_version)
+        api_parts.append(normalized_path)
+        return "/".join(str(part).strip("/") for part in api_parts if part is not None and str(part).strip("/"))
+
+    def request(
+        self,
+        method="GET",
+        path="/",
+        data=None,
+        json=None,
+        flags=None,
+        params=None,
+        headers=None,
+        files=None,
+        trailing=None,
+        absolute=False,
+        advanced_mode=False,
+        allow_redirects=True,
+    ):
+        if not absolute:
+            path = self._server_api_path(path)
+        return super(Server, self).request(
+            method=method,
+            path=path,
+            data=data,
+            json=json,
+            flags=flags,
+            params=params,
+            headers=headers,
+            files=files,
+            trailing=trailing,
+            absolute=absolute,
+            advanced_mode=advanced_mode,
+            allow_redirects=allow_redirects,
+        )
 
     @staticmethod
     def _create_body(body, representation):
@@ -139,7 +212,12 @@ class Server(ConfluenceServerBase):
 
     def page_exists(self, space_key, title, **kwargs):
         """Check if page exists."""
-        result = self.get_page_by_title(space_key, title, **kwargs)
+        try:
+            result = self.get_page_by_title(space_key, title, **kwargs)
+        except HTTPError as error:
+            if error.response is not None and error.response.status_code == 404:
+                return False
+            raise
         return len(result.get("results", [])) > 0
 
     def blog_post_exists(self, space_key, title, **kwargs):
@@ -163,7 +241,8 @@ class Server(ConfluenceServerBase):
 
     def get_page_space(self, page_id):
         """Get space key from page ID."""
-        page = self.get_content(page_id, expand="space")
+        params = {"expand": "space"}
+        page = self.get(f"content/{page_id}", params=params)
         return page.get("space", {}).get("key")
 
     def get_page_child_by_type(self, page_id, type="page", start=None, limit=None, expand=None):
@@ -206,6 +285,24 @@ class Server(ConfluenceServerBase):
 
             raise
 
+    def get_page_child_count(self, page_id, type="page"):
+        """Return the number of direct children of ``type`` without listing them.
+
+        Confluence returns the collection size when the corresponding child
+        collection is expanded, so this requires one content request rather
+        than paginating all children.
+        """
+        page = self.get_page_by_id(page_id, expand=f"children.{type}")
+        collection = page.get("children", {}).get(type, {})
+        size = collection.get("size")
+        if size is not None:
+            return int(size)
+        return len(collection.get("results", []))
+
+    def page_has_children(self, page_id, type="page"):
+        """Return whether a page has at least one direct child of ``type``."""
+        return self.get_page_child_count(page_id, type=type) > 0
+
     def get_child_title_list(self, page_id, type="page", start=None, limit=None):
         """
         Find a list of Child title
@@ -244,13 +341,16 @@ class Server(ConfluenceServerBase):
 
     def get_page_id(self, space, title, type="page"):
         """
-        Provide content id from search result by title and space.
+        Get page ID by searching for it by space key and title - returns the ID from the first result or None if not found.
         :param space: SPACE key
         :param title: title
         :param type: type of content: Page or Blogpost. Defaults to page
         :return:
         """
-        return (self.get_page_by_title(space, title, type=type) or {}).get("id")
+        json_response = self.get_page_by_title(space, title, type=type)
+        if json_response and "results" in json_response and len(json_response["results"]) > 0:
+            return json_response["results"][0]["id"]
+        return None
 
     def get_parent_content_id(self, page_id):
         """
@@ -319,7 +419,7 @@ class Server(ConfluenceServerBase):
             params["status"] = status
         if version:
             params["version"] = version
-        url = f"rest/api/content/{page_id}"
+        url = f"content/{page_id}"
 
         try:
             response = self.get(url, params=params)
@@ -337,45 +437,34 @@ class Server(ConfluenceServerBase):
         return response
 
     def get_tables_from_page(self, page_id):
-        """
-        Fetches html  tables added to  confluence page
-        :param page_id: integer confluence page_id
-        :return: json object with page_id, number_of_tables_in_page
-                 and list of list tables_content representing scraped tables
+        """Return a consistent table summary for a page.
+
+        The returned dictionary always contains ``page_id``,
+        ``number_of_tables_in_page``, and ``tables_content``. Empty pages and
+        pages without tables return a count of zero and an empty list.
         """
         try:
             page_content = self.get_page_by_id(page_id, expand="body.storage")["body"]["storage"]["value"]
-
-            if page_content:
-                tables_raw = [
-                    [[cell.text for cell in row("th") + row("td")] for row in table("tr")]
-                    for table in BeautifulSoup(page_content, features="lxml")("table")
-                ]
-                if len(tables_raw) > 0:
-                    return json.dumps(
-                        {
-                            "page_id": page_id,
-                            "number_of_tables_in_page": len(tables_raw),
-                            "tables_content": tables_raw,
-                        }
-                    )
-                else:
-                    return {
-                        "No tables found for page: ": page_id,
-                    }
-            else:
-                return {"Page content is empty"}
         except HTTPError as e:
             if e.response.status_code == 404:
-                # Raise ApiError as the documented reason is ambiguous
-                log.error("Couldn't retrieve tables  from page", page_id)
                 raise ApiError(
                     "There is no content with the given pageid, pageid params is not an integer "
                     "or the calling user does not have permission to view the page",
                     reason=e,
                 )
-        except Exception as e:
-            log.error("Error occured", e)
+            raise
+
+        tables_raw = []
+        if page_content:
+            tables_raw = [
+                [[cell.text for cell in row("th") + row("td")] for row in table("tr")]
+                for table in BeautifulSoup(page_content, features="html.parser")("table")
+            ]
+        return {
+            "page_id": page_id,
+            "number_of_tables_in_page": len(tables_raw),
+            "tables_content": tables_raw,
+        }
 
     def scrap_regex_from_page(self, page_id, regex):
         """
@@ -449,16 +538,23 @@ class Server(ConfluenceServerBase):
         location=None,
         depth=None,
     ):
-        """
+        """Return a page's comments through the separate comments endpoint.
 
-        :param content_id:
-        :param expand: extensions.inlineProperties,extensions.resolution
-        :param parent_version:
-        :param start:
-        :param limit:
-        :param location: inline or not
-        :param depth:
-        :return:
+        Comments are not included in :meth:`get_page_by_id`. To retrieve a
+        rendered comment body and author metadata, use
+        ``expand='body.view,history,version'``. The initial author is available
+        in ``history.createdBy`` and the latest editor in ``version.by``.
+
+        :param content_id: Page/content ID
+        :param expand: Content expansions, for example
+            ``body.view,history,version``. Inline-comment metadata can use
+            ``extensions.inlineProperties,extensions.resolution``.
+        :param parent_version: Filter comments for a parent version
+        :param start: Page offset
+        :param limit: Number of comments per response page
+        :param location: ``inline`` to request inline comments
+        :param depth: Nested comment depth
+        :return: Paginated Confluence comment response
         """
         params = {"id": content_id, "start": start, "limit": limit}
         if expand:
@@ -608,6 +704,28 @@ class Server(ConfluenceServerBase):
         """
         url = f"rest/api/content/{content_id}/restriction/byOperation"
         return self.get(url)
+
+    def set_restrictions_for_content(self, content_id, restrictions):
+        """Set page or blog-post restrictions using the REST API.
+
+        ``restrictions`` is a list of ContentRestriction objects. Each
+        supplied operation replaces its existing restrictions; operations not
+        present in the list are unchanged. Supplying an empty ``user`` or
+        ``group`` list clears that subject type for the operation.
+
+        Example::
+
+            [{
+                "operation": "read",
+                "restrictions": {
+                    "user": [{"type": "known", "username": "alice"}],
+                    "group": [{"type": "group", "name": "engineering"}],
+                },
+            }]
+        """
+        if not isinstance(restrictions, list):
+            raise ApiValueError("restrictions must be a list of ContentRestriction objects")
+        return self.put(f"rest/api/content/{content_id}/restriction", data=restrictions)
 
     def get_all_restrictions_from_page_json_rpc(self, page_id):
         """
@@ -817,6 +935,11 @@ class Server(ConfluenceServerBase):
         try:
             response = self.delete(f"rest/api/content/{content_id}")
         except HTTPError as e:
+            if e.response.status_code == 403:
+                raise ApiPermissionError(
+                    "The calling user does not have permission to trash or purge the content",
+                    reason=e,
+                )
             if e.response.status_code == 404:
                 # Raise ApiError as the documented reason is ambiguous
                 raise ApiError(
@@ -836,15 +959,21 @@ class Server(ConfluenceServerBase):
 
     def remove_page(self, page_id, status=None, recursive=False):
         """
-        This method removes a page, if it has recursive flag, method removes including child pages
-        :param page_id:
-        :param status: OPTIONAL: type of page
-        :param recursive: OPTIONAL: if True - will recursively delete all children pages too
-        :return:
+        Remove a page and optionally its child pages.
+
+        :param page_id: page ID
+        :param status: optional content status (for example ``"trashed"``)
+        :param recursive: if True, remove child pages before this page
+        :return: the successful HTTP status code (normally ``204``). When the
+            client has ``advanced_mode=True``, return the raw response instead.
         """
         url = f"rest/api/content/{page_id}"
         if recursive:
-            children_pages = self.get_page_child_by_type(page_id)
+            # Fetch every child before deleting any of them. Confluence uses
+            # offset pagination for this resource; deleting a child while
+            # consuming the generator changes the collection and can make a
+            # subsequent offset skip pages shifted earlier in the collection.
+            children_pages = list(self.get_page_child_by_type(page_id))
             for children_page in children_pages:
                 self.remove_page(children_page.get("id"), status, recursive)
         params = {}
@@ -852,8 +981,13 @@ class Server(ConfluenceServerBase):
             params["status"] = status
 
         try:
-            response = self.delete(url, params=params)
+            response = self.delete(url, params=params, advanced_mode=True)
         except HTTPError as e:
+            if e.response.status_code == 403:
+                raise ApiPermissionError(
+                    "The calling user does not have permission to trash or purge the content",
+                    reason=e,
+                )
             if e.response.status_code == 404:
                 # Raise ApiError as the documented reason is ambiguous
                 raise ApiError(
@@ -869,7 +1003,9 @@ class Server(ConfluenceServerBase):
 
             raise
 
-        return response
+        if self.advanced_mode:
+            return response
+        return response.status_code
 
     def create_page(
         self,
@@ -882,18 +1018,21 @@ class Server(ConfluenceServerBase):
         editor=None,
         full_width=False,
         status="current",
+        version_comment=None,
     ):
         """
         Create page from scratch
-        :param space:
-        :param title:
-        :param body:
-        :param parent_id:
-        :param type:
+        :param space: **space key**, not the display name. Personal-space keys
+            commonly look like ``~<account-id>``.
+        :param title: page title
+        :param body: page body in the selected representation
+        :param parent_id: optional parent page ID
+        :param type: content type; normally ``"page"``
         :param representation: OPTIONAL: either Confluence 'storage' or 'wiki' markup format
         :param editor: OPTIONAL: v2 to be created in the new editor
         :param full_width: DEFAULT: False
         :param status: either 'current' or 'draft'
+        :param version_comment: optional message recorded with the first page version
         :return:
         """
         log.info('Creating %s "%s" -> "%s"', type, space, title)
@@ -908,6 +1047,8 @@ class Server(ConfluenceServerBase):
         }
         if parent_id:
             data["ancestors"] = [{"type": type, "id": parent_id}]
+        if version_comment is not None:
+            data["version"] = {"message": version_comment}
         if editor is not None and editor in ["v1", "v2"]:
             data["metadata"]["properties"]["editor"] = {"value": editor}
         if full_width is True:
@@ -920,6 +1061,13 @@ class Server(ConfluenceServerBase):
         try:
             response = self.post(url, data=data)
         except HTTPError as e:
+            if e.response.status_code == 403:
+                raise ApiPermissionError(
+                    f"Cannot create a page in space '{space}'. Use the space key "
+                    "(not its display name), then verify the API user has "
+                    "permission to create pages in that space.",
+                    reason=e,
+                )
             if e.response.status_code == 404:
                 raise ApiPermissionError(
                     "The calling user does not have permission to view the content",
@@ -984,7 +1132,16 @@ class Server(ConfluenceServerBase):
         :type  content_type: ``str``
         :param comment: A comment describing this upload/file
         :type  comment: ``str``
+        :return: The attachment response.
+        :raises ApiNotFoundError: If no page ID is supplied and the title cannot
+            be resolved in the requested space.
         """
+        # Confluence attachment names are filenames, not paths. Normalize both
+        # POSIX and Windows separators before Confluence can silently collapse
+        # them into an existing basename.
+        name = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+        if not name:
+            raise ApiValueError("Attachment name must contain a filename")
         page_id = self.get_page_id(space=space, title=title) if page_id is None else page_id
         type = "attachment"
         if page_id is not None:
@@ -1001,18 +1158,40 @@ class Server(ConfluenceServerBase):
                 "Accept": "application/json",
             }
             path = f"rest/api/content/{page_id}/child/attachment"
-            # Check if there is already a file with the same name
-            attachments = self.get(path=path, headers=headers, params={"filename": name})
-            if attachments.get("size"):
-                path = path + "/" + attachments["results"][0]["id"] + "/data"
 
             try:
-                response = self.post(
-                    path=path,
-                    data=data,
-                    headers=headers,
-                    files={"file": (name, content, content_type)},
-                )
+                # Confluence Server doesn't support PUT on the child/attachment endpoint.
+                # We need to check if the attachment exists first, then create or update accordingly.
+                # GET existing attachment to check if it exists
+                existing_attachment = None
+                try:
+                    attachments = self.get(path=path, headers=headers)
+                    if "results" in attachments:
+                        for attachment in attachments["results"]:
+                            if attachment.get("title") == name:
+                                existing_attachment = attachment
+                                break
+                except HTTPError:
+                    pass
+
+                if existing_attachment:
+                    # Update existing attachment using PUT on the specific attachment ID
+                    attachment_id = existing_attachment["id"]
+                    update_path = f"rest/api/content/{attachment_id}"
+                    response = self.put(
+                        path=update_path,
+                        data=data,
+                        headers=headers,
+                        files={"file": (name, content, content_type)},
+                    )
+                else:
+                    # Create new attachment using POST
+                    response = self.post(
+                        path=path,
+                        data=data,
+                        headers=headers,
+                        files={"file": (name, content, content_type)},
+                    )
             except HTTPError as e:
                 if e.response.status_code == 403:
                     # Raise ApiError as the documented reason is ambiguous
@@ -1034,8 +1213,7 @@ class Server(ConfluenceServerBase):
 
             return response
         else:
-            log.warning("No 'page_id' found, not uploading attachments")
-            return None
+            raise ApiNotFoundError("No page ID was supplied and the target page could not be found")
 
     def attach_file(
         self,
@@ -1085,7 +1263,9 @@ class Server(ConfluenceServerBase):
                 comment=comment,
             )
 
-    def download_attachments_from_page(self, page_id, path=None, start=0, limit=50, filename=None, to_memory=False):
+    def download_attachments_from_page(
+        self, page_id, path=None, start=0, limit=50, filename=None, to_memory=False, download_path=None
+    ):
         """
         Downloads attachments from a Confluence page. Supports downloading all files or a specific file.
         Files can either be saved to disk or returned as BytesIO objects for in-memory handling.
@@ -1095,6 +1275,9 @@ class Server(ConfluenceServerBase):
         :param path: str, optional
             Directory where attachments will be saved. If None, defaults to the current working directory.
             Ignored if `to_memory` is True.
+        :param download_path: str, optional
+            Deprecated alias for ``path`` retained for callers of older
+            documentation. Do not pass both names with different values.
         :param start: int, optional
             The start point for paginated attachment fetching. Default is 0. Ignored if `filename` is specified.
         :param limit: int, optional
@@ -1113,6 +1296,11 @@ class Server(ConfluenceServerBase):
             - requests.HTTPError: If the HTTP request to fetch an attachment fails.
             - Exception: For any unexpected errors.
         """
+        if download_path is not None:
+            if path is not None and path != download_path:
+                raise ApiValueError("Specify only one of path or download_path")
+            path = download_path
+
         # Default path to current working directory if not provided
         if not to_memory and path is None:
             path = os.getcwd()
@@ -1123,18 +1311,39 @@ class Server(ConfluenceServerBase):
                 # Fetch specific file by filename
                 attachments = self.get_attachments_from_content(page_id=page_id, filename=filename)["results"]
                 if not attachments:
-                    return f"No attachment with filename '{filename}' found on the page."
+                    return {} if to_memory else {"attachments_downloaded": 0, "path": path}
             else:
-                # Fetch all attachments with pagination
-                attachments = self.get_attachments_from_content(page_id=page_id, start=start, limit=limit)["results"]
+                # Fetch all attachment pages. Confluence defaults to 50 results,
+                # so a single request silently omits attachments on larger pages.
+                attachments = []
+                current_start = start
+                while True:
+                    attachment_page = self.get_attachments_from_content(
+                        page_id=page_id, start=current_start, limit=limit
+                    )
+                    page_results = attachment_page.get("results", [])
+                    attachments.extend(page_results)
+
+                    total_size = attachment_page.get("totalSize")
+                    if not page_results or (total_size is not None and current_start + len(page_results) >= total_size):
+                        break
+                    if total_size is None and len(page_results) < limit:
+                        break
+                    current_start += len(page_results)
                 if not attachments:
-                    return "No attachments found on the page."
+                    return {} if to_memory else {"attachments_downloaded": 0, "path": path}
 
             # Prepare to handle downloads
             downloaded_files = {}
             for attachment in attachments:
                 file_name = attachment["title"] or attachment["id"]  # Use attachment ID if title is unavailable
-                download_link = attachment["_links"]["download"]
+                if self.cloud:
+                    # ``_links.download`` points to the deprecated Cloud
+                    # attachment download route.  Use the supported REST
+                    # content-attachment endpoint instead.
+                    download_link = f"rest/api/content/{page_id}/child/attachment/{attachment['id']}/download"
+                else:
+                    download_link = attachment["_links"]["download"]
                 # Fetch the file content
                 response = self.get(str(download_link), not_json_response=True)
 
@@ -1151,8 +1360,6 @@ class Server(ConfluenceServerBase):
                             UserWarning,
                         )
                         file_name = sanitized
-                    file_path = os.path.join(path, file_name)
-                    # Save file to disk
                     file_path = os.path.join(path, file_name)
                     with open(file_path, "wb") as file:
                         file.write(response)
@@ -1187,6 +1394,36 @@ class Server(ConfluenceServerBase):
         else:
             url = f"rest/experimental/content/{attachment_id}/version/{version}"
         return self.delete(url)
+
+    def move_or_update_attachment_json_rpc(
+        self,
+        originalContentId: str,
+        originalName: str,
+        newContentEntityId: Optional[str] = None,
+        newName: Optional[str] = None,
+    ):
+        """
+        Move attachment from source confluence page to destination confluence page optionally with new title
+        OR
+        Just update attachment from source confluence page with new title
+        via JSON-RPC.
+        :param str originalContentId: confluence source page id
+        :param str newContentEntityId: confluence destination page id
+        :param str originalName: source attachment title
+        :param str newName: new attachment title
+        """
+        if self.api_version == "cloud" or self.cloud:
+            return {}
+        url = "rpc/json-rpc/confluenceservice-v2"
+        data = {
+            "jsonrpc": "2.0",
+            "method": "moveAttachment",
+            "id": 9,
+            "params": [originalContentId, originalName, newContentEntityId, newName],
+        }
+
+        response = self.post(url, data=data)
+        return (response or {}).get("result") or {}
 
     def remove_page_attachment_keep_version(self, page_id, filename, keep_last_versions):
         """
@@ -1333,7 +1570,7 @@ class Server(ConfluenceServerBase):
         return response
 
     def history(self, page_id):
-        url = f"rest/api/content/{page_id}/history"
+        url = f"content/{page_id}/history"
         try:
             response = self.get(url)
         except HTTPError as e:
@@ -1352,18 +1589,50 @@ class Server(ConfluenceServerBase):
     def get_content_history(self, content_id):
         return self.history(content_id)
 
-    def get_content_history_by_version_number(self, content_id, version_number):
+    def iter_page_versions(self, page_id, limit=200, expand=None):
+        """Yield every version of a Server/Data Center page.
+
+        The dedicated ``content/{id}/version`` endpoint is paginated. This
+        method follows its links lazily, avoiding one request per version.
+        """
+        params = {"limit": int(limit)}
+        if expand is not None:
+            params["expand"] = expand
+        return self._get_paged(f"content/{page_id}/version", params=params)
+
+    def get_all_page_versions(self, page_id, limit=200, expand=None):
+        """Return every version of a Server/Data Center page as a list."""
+        return list(self.iter_page_versions(page_id, limit=limit, expand=expand))
+
+    def get_content_history_by_version_number(self, content_id, version_number, expand=None):
         """
         Get content history by version number
         :param content_id:
         :param version_number:
         :return:
         """
-        if self.cloud:
-            url = f"rest/api/content/{content_id}/version/{version_number}"
-        else:
-            url = f"rest/experimental/content/{content_id}/version/{version_number}"
-        return self.get(url)
+        # The experimental endpoint was retired by recent Server/Data Center
+        # releases. Cloud and Server/Data Center now expose this operation at
+        # the same REST API path.
+        params = {"expand": expand} if expand is not None else {}
+        return self.get(f"content/{content_id}/version/{version_number}", params=params)
+
+    def get_page_version_contributors(self, page_id, version_number):
+        """Return every known contributor to a page revision.
+
+        Collaborative-editing revisions expose a ``collaborators`` collection.
+        Older Confluence releases expose only ``by``; in that case the saving
+        author is returned as a one-item list.
+        """
+        version = self.get_content_history_by_version_number(page_id, version_number, expand="collaborators")
+        collaborators = version.get("collaborators") or version.get("version", {}).get("collaborators")
+        if isinstance(collaborators, dict):
+            collaborators = collaborators.get("users") or collaborators.get("results") or []
+        if isinstance(collaborators, list):
+            return collaborators
+
+        author = version.get("by") or version.get("version", {}).get("by")
+        return [author] if author else []
 
     def remove_content_history(self, page_id, version_number):
         """
@@ -1372,11 +1641,7 @@ class Server(ConfluenceServerBase):
         :param version_number: version number
         :return:
         """
-        if self.cloud:
-            url = f"rest/api/content/{page_id}/version/{version_number}"
-        else:
-            url = f"rest/experimental/content/{page_id}/version/{version_number}"
-        self.delete(url)
+        return self.delete(f"content/{page_id}/version/{version_number}")
 
     def remove_page_history(self, page_id, version_number):
         """
@@ -1394,23 +1659,41 @@ class Server(ConfluenceServerBase):
         :param version_id:
         :return:
         """
-        url = f"rest/api/content/{page_id}/version/{version_id}"
-        self.delete(url)
+        return self.remove_content_history(page_id, version_id)
 
     def remove_page_history_keep_version(self, page_id, keep_last_versions):
         """
-        Keep last versions
-        :param page_id:
-        :param keep_last_versions:
-        :return:
+        Remove the oldest page versions while retaining the requested number of
+        newest versions.
+
+        Confluence version numbers are immutable: deleting version 1 does not
+        cause version 2 to become version 1.  Delete each obsolete version
+        number exactly once rather than repeatedly deleting version 1.
+
+        :param page_id: Page whose history should be pruned.
+        :param keep_last_versions: Number of latest versions to retain. Must be
+            a positive integer.
         """
+        if not isinstance(keep_last_versions, int) or isinstance(keep_last_versions, bool) or keep_last_versions < 1:
+            raise ValueError("keep_last_versions must be a positive integer")
+
         page = self.get_page_by_id(page_id=page_id, expand="version")
-        page_number = page.get("version").get("number")
-        while page_number > keep_last_versions:
-            self.remove_page_history(page_id=page_id, version_number=1)
-            page = self.get_page_by_id(page_id=page_id, expand="version")
-            page_number = page.get("version").get("number")
-            log.info("Removed oldest version for %s, now it's %s", page.get("title"), page_number)
+        page_number = page.get("version", {}).get("number")
+        if not isinstance(page_number, int):
+            raise ValueError("Page response does not contain a valid version number")
+
+        for version_number in range(1, max(page_number - keep_last_versions, 0) + 1):
+            try:
+                self.remove_page_history(page_id=page_id, version_number=version_number)
+            except HTTPError as error:
+                # Version numbers are immutable and may contain gaps when a
+                # previous run already deleted an older version. That is a
+                # successful pruning outcome, not a fatal error.
+                if error.response is None or error.response.status_code != 404:
+                    raise
+                log.debug("Version %s for %s is already absent", version_number, page_id)
+                continue
+            log.info("Removed version %s for %s", version_number, page.get("title"))
         log.info("Kept versions %s for %s", keep_last_versions, page.get("title"))
 
     def has_unknown_attachment_error(self, page_id):
@@ -1479,7 +1762,13 @@ class Server(ConfluenceServerBase):
         version_comment=None,
         full_width=False,
     ):
-        """Duplicate update_page. Left for the people who used it before. Use update_page instead"""
+        """Backward-compatible alias for :meth:`update_page`.
+
+        ``body`` is sent unchanged.  In particular, callers updating a table
+        that contains Confluence image macros must retain the original storage
+        markup.  ``pandas.read_html`` cannot preserve those macros and its
+        subsequent ``to_html`` output may replace image cells with ``NaN``.
+        """
         return self.update_page(
             page_id=page_id,
             title=title,
@@ -1505,19 +1794,29 @@ class Server(ConfluenceServerBase):
         full_width=False,
     ):
         """
-        Update page if already exist
-        :param page_id:
-        :param title:
-        :param body:
-        :param parent_id:
-        :param type:
-        :param representation: OPTIONAL: either Confluence 'storage' or 'wiki' markup format
+        Update an existing page.
+
+        ``body`` must be Confluence storage XHTML when ``representation`` is
+        ``"storage"`` (the default), not arbitrary browser HTML. Escape only
+        dynamic text or attribute values; do not escape the complete markup or
+        Confluence macros. A literal ``&`` in text must be ``&amp;``. Existing
+        entities such as ``&quot;`` must not be escaped a second time.
+
+        :param page_id: existing Confluence page ID
+        :param title: page title
+        :param body: storage XHTML or wiki markup matching ``representation``
+        :param parent_id: optional parent page ID; omit to retain the parent
+        :param type: content type; normally ``"page"``
+        :param representation: ``"storage"`` for editable storage XHTML or
+            ``"wiki"`` for legacy wiki markup
         :param minor_edit: Indicates whether to notify watchers about changes.
             If False then notifications will be sent.
         :param version_comment: Version comment
         :param always_update: Whether always to update (suppress content check)
         :param full_width: OPTIONAL: Default False
-        :return:
+        :return: The updated page response.
+        :raises ApiNotFoundError: If the page cannot be found while retrieving
+            its current version.
         """
         # update current page
         params = {"status": "current"}
@@ -1532,9 +1831,7 @@ class Server(ConfluenceServerBase):
             else:
                 version = self.history(page_id)["lastUpdated"]["number"] + 1
         except (IndexError, TypeError) as e:
-            log.error("Can't find '%s' %s!", title, type)
-            log.debug(e)
-            return None
+            raise ApiNotFoundError(f"Can't find '{title}' {type}!") from e
 
         data = {
             "id": page_id,
@@ -1559,16 +1856,17 @@ class Server(ConfluenceServerBase):
             data["metadata"]["properties"]["content-appearance-published"] = {"value": "fixed-width"}
         try:
             response = self.put(
-                f"rest/api/content/{page_id}",
+                f"content/{page_id}",
                 data=data,
                 params=params,
             )
         except HTTPError as e:
             if e.response.status_code == 400:
                 raise ApiValueError(
-                    "No space or no content type, or setup a wrong version "
-                    "type set to content, or status param is not draft and "
-                    "status content is current",
+                    "Confluence rejected the page update. Verify that the page "
+                    "is current and that body is valid storage XHTML: preserve "
+                    "Confluence macros, escape dynamic '&' as '&amp;', and do "
+                    "not escape the complete document or existing entities.",
                     reason=e,
                 )
             if e.response.status_code == 404:
@@ -1661,23 +1959,27 @@ class Server(ConfluenceServerBase):
         minor_edit=False,
     ):
         """
-        Append body to page if already exist
-        :param parent_id:
-        :param page_id:
-        :param title:
-        :param append_body:
-        :param type:
-        :param representation: OPTIONAL: either Confluence 'storage' or 'wiki' markup format
-        :param minor_edit: Indicates whether to notify watchers about changes.
-            If False then notifications will be sent.
-        :return:
+        Append content to an existing page.
+
+        ``append_body`` is normally a string of Confluence storage XHTML. A
+        ``list`` or ``dict`` is supported with ``representation="storage"``
+        and is appended as pretty-printed JSON in a Confluence code block.
+
+        :param parent_id: optional parent page ID
+        :param page_id: page ID
+        :param title: page title
+        :param append_body: storage XHTML, or a list/dict to render as JSON
+        :param type: content type; normally ``"page"``
+        :param representation: ``"storage"`` or legacy ``"wiki"`` markup
+        :param minor_edit: whether to suppress watcher notifications
+        :return: the updated page response
         """
         log.info('Updating %s "%s"', type, title)
 
         return self._insert_to_existing_page(
             page_id,
             title,
-            append_body,
+            self._coerce_structured_storage_body(append_body, representation),
             parent_id=parent_id,
             type=type,
             representation=representation,
@@ -1712,7 +2014,7 @@ class Server(ConfluenceServerBase):
         return self._insert_to_existing_page(
             page_id,
             title,
-            prepend_body,
+            self._coerce_structured_storage_body(prepend_body, representation),
             parent_id=parent_id,
             type=type,
             representation=representation,
@@ -1720,33 +2022,73 @@ class Server(ConfluenceServerBase):
             top_of_page=True,
         )
 
+    @staticmethod
+    def _coerce_structured_storage_body(body, representation):
+        """Render structured input as a safe JSON code block for storage pages."""
+        if isinstance(body, str):
+            return body
+        if not isinstance(body, (list, dict)):
+            raise ApiValueError("Page content must be a string, list, or dictionary")
+        if representation != "storage":
+            raise ApiValueError("Lists and dictionaries require representation='storage'")
+
+        # Split a CDATA terminator so arbitrary JSON cannot close the storage
+        # macro's plain-text body.
+        cdata_end = "]]" + ">"
+        cdata_escape = "]]" + "]]><![CDATA[>"
+        json_body = json.dumps(body, ensure_ascii=False, indent=2).replace(cdata_end, cdata_escape)
+        return (
+            '<ac:structured-macro ac:name="code">'
+            '<ac:parameter ac:name="language">json</ac:parameter>'
+            f"<ac:plain-text-body><![CDATA[{json_body}]]></ac:plain-text-body>"
+            "</ac:structured-macro>"
+        )
+
     def update_or_create(
         self,
-        parent_id,
-        title,
-        body,
+        parent_id=None,
+        title=None,
+        body=None,
         representation="storage",
         minor_edit=False,
         version_comment=None,
         editor=None,
         full_width=False,
+        space=None,
     ):
         """
         Update page or create a page if it is not exists
-        :param parent_id:
-        :param title:
-        :param body:
+        :param parent_id: optional parent page ID.  Omit for a top-level page.
+        :param title: page title
+        :param body: page body
         :param representation: OPTIONAL: either Confluence 'storage' or 'wiki' markup format
         :param minor_edit: Update page without notification
         :param version_comment: Version comment
         :param editor: OPTIONAL: v2 to be created in the new editor
         :param full_width: OPTIONAL: Default is False
+        :param space: space key. Required when ``parent_id`` is omitted.
         :return:
-        """
-        space = self.get_page_space(parent_id)
 
-        if self.page_exists(space, title):
-            page_id = self.get_page_id(space, title)
+        Note:
+            Confluence does not update archived pages through this workflow.
+            Restore the page to the current state before calling this method.
+        """
+        if title is None or body is None:
+            raise ApiValueError("title and body are required")
+        if space is None:
+            if parent_id is None:
+                raise ApiValueError("space is required when parent_id is omitted")
+            space = self.get_page_space(parent_id)
+
+        # A title is only unique among siblings.  Searching the whole space
+        # when a parent is supplied could update and move a same-titled page
+        # from another branch (#956).
+        if parent_id is not None:
+            page_id = self.get_descendant_page_id(space, parent_id, title) or None
+        else:
+            page_id = self.get_page_id(space, title) if self.page_exists(space, title) else None
+
+        if page_id is not None:
             parent_id = parent_id if parent_id is not None else self.get_parent_content_id(page_id)
             result = self.update_page(
                 parent_id=parent_id,
@@ -1759,14 +2101,19 @@ class Server(ConfluenceServerBase):
                 full_width=full_width,
             )
         else:
+            create_kwargs = {
+                "space": space,
+                "parent_id": parent_id,
+                "title": title,
+                "body": body,
+                "representation": representation,
+                "editor": editor,
+                "full_width": full_width,
+            }
+            if version_comment is not None:
+                create_kwargs["version_comment"] = version_comment
             result = self.create_page(
-                space=space,
-                parent_id=parent_id,
-                title=title,
-                body=body,
-                representation=representation,
-                editor=editor,
-                full_width=full_width,
+                **create_kwargs,
             )
 
         log.info(
@@ -1798,14 +2145,20 @@ class Server(ConfluenceServerBase):
         """
         Set the page (content) property e.g. add hash parameters
         :param page_id: content_id format
-        :param data: data should be as json data
+        :param data: property dictionary, or a JSON string representing one
         :return:
         """
-        url = f"rest/api/content/{page_id}/property"
-        json_data = data
+        url = f"content/{page_id}/property"
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as error:
+                raise ApiValueError("Page property data must be valid JSON", reason=error)
+        if not isinstance(data, dict):
+            raise ApiValueError("Page property data must be a dictionary")
 
         try:
-            response = self.post(path=url, data=json_data)
+            response = self.post(path=url, data=data)
         except HTTPError as e:
             if e.response.status_code == 400:
                 raise ApiValueError(
@@ -1830,12 +2183,20 @@ class Server(ConfluenceServerBase):
         """
         Update the page (content) property.
         Use json data or independent keys
-        :param data:
+        :param data: property dictionary, or a JSON string representing one
         :param page_id: content_id format
         :data: property data in json format
         :return:
         """
-        url = f"rest/api/content/{page_id}/property/{data.get('key')}"
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as error:
+                raise ApiValueError("Page property data must be valid JSON", reason=error)
+        if not isinstance(data, dict):
+            raise ApiValueError("Page property data must be a dictionary")
+
+        url = f"content/{page_id}/property/{data.get('key')}"
         try:
             response = self.put(path=url, data=data)
         except HTTPError as e:
@@ -1874,7 +2235,7 @@ class Server(ConfluenceServerBase):
         :param page_property: key of property
         :return:
         """
-        url = f"rest/api/content/{page_id}/property/{str(page_property)}"
+        url = f"content/{page_id}/property/{str(page_property)}"
         try:
             response = self.delete(path=url)
         except HTTPError as e:
@@ -1897,7 +2258,7 @@ class Server(ConfluenceServerBase):
         :param page_property_key: key of property
         :return:
         """
-        url = f"rest/api/content/{page_id}/property/{str(page_property_key)}"
+        url = f"content/{page_id}/property/{str(page_property_key)}"
         try:
             response = self.get(path=url)
         except HTTPError as e:
@@ -1914,16 +2275,28 @@ class Server(ConfluenceServerBase):
 
         return response
 
-    def get_page_properties(self, page_id):
+    def get_page_properties(self, page_id, limit=100, expand=None):
+        """Return every property attached to a page.
+
+        Confluence paginates this endpoint and otherwise returns only its small
+        server-defined default page (commonly ten properties).  Pagination is
+        handled internally; ``limit`` controls the size of each HTTP request,
+        not the number of properties returned.
+
+        :param page_id: content ID
+        :param limit: maximum properties requested per API call
+        :param expand: optional property fields to expand
+        :return: list of page property objects
         """
-        Get the page (content) properties
-        :param page_id: content_id format
-        :return: get properties
-        """
-        url = f"rest/api/content/{page_id}/property"
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+
+        params = {"limit": limit}
+        if expand:
+            params["expand"] = expand
 
         try:
-            response = self.get(path=url)
+            return list(self._get_paged(f"content/{page_id}/property", params=params))
         except HTTPError as e:
             if e.response.status_code == 404:
                 # Raise ApiError as the documented reason is ambiguous
@@ -1934,8 +2307,6 @@ class Server(ConfluenceServerBase):
                 )
 
             raise
-
-        return response
 
     def get_page_ancestors(self, page_id):
         """
@@ -1966,6 +2337,7 @@ class Server(ConfluenceServerBase):
         expand=None,
         space_type=None,
         space_status=None,
+        label=None,
     ):
         """
         Get all spaces with provided limit
@@ -1974,6 +2346,7 @@ class Server(ConfluenceServerBase):
                             fixed system limits. Default: 500
         :param space_type: OPTIONAL: Filter the list of spaces returned by type (global, personal)
         :param space_status: OPTIONAL: Filter the list of spaces returned by status (current, archived)
+        :param label: OPTIONAL: Filter the list of spaces by a category label.
         :param expand: OPTIONAL: additional info, e.g. metadata, icon, description, homepage
         """
         url = "rest/api/space"
@@ -1988,7 +2361,34 @@ class Server(ConfluenceServerBase):
             params["type"] = space_type
         if space_status:
             params["status"] = space_status
+        if label:
+            params["label"] = label
         return self.get(url, params=params)
+
+    def get_space_names(self, start=0, limit=50, space_type=None, space_status=None, label=None):
+        """Return every visible Server/Data Center space name.
+
+        Only the space directory metadata endpoint is requested; no page or
+        space content is downloaded.
+        """
+        names = []
+        current_start = start
+        while True:
+            response = self.get_all_spaces(
+                start=current_start,
+                limit=limit,
+                space_type=space_type,
+                space_status=space_status,
+                label=label,
+            )
+            spaces = response.get("results", [])
+            names.extend(space["name"] for space in spaces if space.get("name"))
+            total_size = response.get("totalSize")
+            if not spaces or (total_size is not None and current_start + len(spaces) >= total_size):
+                return names
+            if total_size is None and len(spaces) < limit:
+                return names
+            current_start += len(spaces)
 
     def archive_space(self, space_key):
         """
@@ -2066,14 +2466,23 @@ class Server(ConfluenceServerBase):
         return self.post("space", data=data, **kwargs)
 
     def update_space(self, space_key, data, **kwargs):
-        """Update existing space."""
+        """Update an existing Server/Data Center space with a REST payload."""
         return self.put(f"space/{space_key}", data=data, **kwargs)
 
-    def delete_space(self, space_key, **kwargs):
+    def set_space_homepage(self, space_key, homepage_id):
+        """Set a Server/Data Center space's homepage to an existing page.
+
+        ``homepage_id`` must identify a page in the target space. The caller
+        needs permission to administer the space and view the chosen page.
         """
-        Delete space
-        :param space_key:
-        :return:
+        return self.update_space(space_key, {"homepage": {"id": homepage_id}})
+
+    def delete_space(self, space_key, **kwargs):
+        """Delete a space by key.
+
+        Raises:
+            ApiNotFoundError: If Confluence responds with HTTP 404. Confluence
+                may use this status to avoid revealing an inaccessible space.
         """
         url = f"space/{space_key}"
 
@@ -2081,7 +2490,7 @@ class Server(ConfluenceServerBase):
             response = self.delete(url, **kwargs)
         except HTTPError as e:
             if e.response.status_code == 404:
-                raise ApiError(
+                raise ApiNotFoundError(
                     "There is no space with the given key, "
                     "or the calling user does not have permission to delete it",
                     reason=e,
@@ -2319,6 +2728,14 @@ class Server(ConfluenceServerBase):
 
             raise
 
+        returned_limit = response.get("limit") if isinstance(response, dict) else None
+        if limit is not None and isinstance(returned_limit, int) and returned_limit < limit:
+            warnings.warn(
+                f"Confluence capped get_group_members limit from {limit} to {returned_limit}; "
+                "use get_all_members to retrieve every member.",
+                UserWarning,
+            )
+
         return response
 
     # Label Management
@@ -2492,7 +2909,10 @@ class Server(ConfluenceServerBase):
 
         if template_id:
             data["templateId"] = template_id
-            return self.put("rest/api/template", data=json.dumps(data))
+            # ``AtlassianRestAPI.put`` serializes ``data`` to JSON.  Passing a
+            # pre-serialized value here turns the complete template into a JSON
+            # string, which Confluence rejects with JsonMappingException.
+            return self.put("rest/api/template", data=data)
 
         return self.post("rest/api/template", json=data)
 
@@ -2543,6 +2963,25 @@ class Server(ConfluenceServerBase):
             raise
 
         return response
+
+    def create_page_from_template(self, space, title, template_id, parent_id=None, replacements=None, **kwargs):
+        """Create a page from a Server/Data Center content template.
+
+        Template bodies are read from the ``storage`` representation so that
+        Confluence macros are retained. ``replacements`` maps literal template
+        placeholders (for example ``{"{{REPORT_DATE}}": "2026-08-15"}``) to
+        their replacement values.
+        """
+        template = self.get_content_template(template_id)
+        try:
+            body = template["body"]["storage"]["value"]
+        except (KeyError, TypeError) as error:
+            raise ApiValueError("The template does not contain a storage body", reason=error)
+
+        for placeholder, value in (replacements or {}).items():
+            body = body.replace(str(placeholder), str(value))
+
+        return self.create_page(space, title, body, parent_id=parent_id, representation="storage", **kwargs)
 
     @deprecated(version="3.7.0", reason="Use get_blueprint_templates()")
     def get_all_blueprints_from_space(self, space, start=0, limit=None, expand=None):
@@ -2868,24 +3307,23 @@ class Server(ConfluenceServerBase):
         :return:
         """
         limit = 50
-        flag = True
-        step = 0
         members = []
-        while flag:
-            values = self.get_group_members(
+        while True:
+            response = self.get_group_members(
                 group_name=group_name,
                 start=len(members),
                 limit=limit,
                 expand=expand,
             )
-            step += 1
-            if len(values) == 0:
-                flag = False
-            else:
-                members.extend(values)
-        if not members:
-            print(f"Did not get members from {group_name} group, please check permissions or connectivity")
-        return members
+            values = response.get("results", []) if isinstance(response, dict) else response or []
+            members.extend(values)
+
+            total_count = response.get("totalSize", response.get("totalCount")) if isinstance(response, dict) else None
+            returned_limit = response.get("limit", limit) if isinstance(response, dict) else limit
+            if not values or (total_count is not None and len(members) >= total_count):
+                return members
+            if total_count is None and len(values) < returned_limit:
+                return members
 
     # Generic
     def cql(
@@ -2936,6 +3374,39 @@ class Server(ConfluenceServerBase):
 
         return response
 
+    def iter_cql(
+        self,
+        cql,
+        start=0,
+        limit=None,
+        expand=None,
+        include_archived_spaces=None,
+        excerpt=None,
+    ):
+        """Yield every result of a CQL search, following Confluence pagination.
+
+        Unlike :meth:`cql`, this does not materialize all results in memory.
+        """
+        params = {"start": int(start)} if start is not None else {}
+        if limit is not None:
+            params["limit"] = int(limit)
+        if cql is not None:
+            params["cql"] = cql
+        if expand is not None:
+            params["expand"] = expand
+        if include_archived_spaces is not None:
+            params["includeArchivedSpaces"] = include_archived_spaces
+        if excerpt is not None:
+            params["excerpt"] = excerpt
+        return self._get_paged("rest/api/search", params=params)
+
+    def cql_all(self, *args, **kwargs):
+        """Return all paginated CQL results as a list.
+
+        Prefer :meth:`iter_cql` for large result sets.
+        """
+        return list(self.iter_cql(*args, **kwargs))
+
     def get_page_as_pdf(self, page_id):
         """
         Export page as standard pdf exporter
@@ -2944,13 +3415,48 @@ class Server(ConfluenceServerBase):
         """
         headers = self.form_token_headers
         url = f"spaces/flyingpdf/pdfpageexport.action?pageId={page_id}"
-        return self.get(url, headers=headers, not_json_response=True)
+        response = self.get(url, headers=headers, advanced_mode=True)
+        content = response.content
+        if not content.startswith(b"%PDF-"):
+            raise ApiError(
+                "Confluence returned non-PDF content while exporting the page. "
+                "Check the page permissions and authentication configuration."
+            )
+        return content
+
+    def iter_page_tree_as_pdf(self, page_id):
+        """Yield ``(page_id, pdf_bytes)`` for a page and all descendant pages.
+
+        Confluence exposes single-page PDF export but does not provide a
+        supported REST operation for one merged arbitrary subtree PDF. Results
+        are yielded in depth-first page-tree order so callers can stream files
+        to disk or merge them with their preferred PDF library.
+        """
+        pending_page_ids = [page_id]
+        while pending_page_ids:
+            current_page_id = pending_page_ids.pop()
+            yield current_page_id, self.get_page_as_pdf(current_page_id)
+            children = list(self.get_page_child_by_type(current_page_id, type="page"))
+            pending_page_ids.extend(child["id"] for child in reversed(children))
+
+    def export_page_tree_as_pdf(self, page_id):
+        """Return individual PDFs for a page subtree keyed by page ID.
+
+        Prefer :meth:`iter_page_tree_as_pdf` for large hierarchies to avoid
+        keeping every PDF in memory.
+        """
+        return dict(self.iter_page_tree_as_pdf(page_id))
 
     def get_page_as_word(self, page_id):
-        """
-        Export page as standard word exporter.
+        """Export a page through Confluence's legacy Word exporter.
+
+        Returns the response bytes exactly as provided by Confluence. The
+        exporter does not produce a DOCX file (nor necessarily a binary DOC
+        file); its output is a Word-readable multipart HTML document. There is
+        no supported Confluence REST endpoint for DOCX export.
+
         :param page_id: Page ID
-        :return: Word File
+        :return: Legacy Word-export bytes
         """
         headers = self.form_token_headers
         url = f"exportword?pageId={page_id}"
@@ -2968,19 +3474,24 @@ class Server(ConfluenceServerBase):
         :return: The URL to download the exported file.
         """
 
+        # Space export is a browser workflow, not a REST resource. ``self.url``
+        # normally ends in ``/rest/api/<version>``, so derive the Confluence UI
+        # context before requesting its action endpoints.
+        ui_base_url = self.url.split("/rest/api/", 1)[0]
+
+        def ui_url(path: str) -> str:
+            return self.url_joiner(ui_base_url, path)
+
         def get_atl_request(link: str):
             # Nested function  used to get atl_token used for XSRF protection.
             # This is only applicable to html/csv/xml space exports
             try:
-                response = self.get(link, advanced_mode=True)
+                response = self.get(ui_url(link), absolute=True, advanced_mode=True)
                 parsed_html = BeautifulSoup(response.text, "html.parser")
                 atl_token = parsed_html.find("input", {"name": "atl_token"}).get("value")  # type: ignore[union-attr]
                 return atl_token
             except Exception as e:
                 raise ApiError("Problems with getting the atl_token for get_space_export method :", reason=e)
-
-        # Checks if space_ke parameter is valid and if api_token has relevant permissions to space
-        self.get_space(space_key=space_key, expand="permissions")
 
         try:
             log.info(
@@ -3019,10 +3530,18 @@ class Server(ConfluenceServerBase):
                 raise ValueError("PDF space export is not supported yet for Server/Data Center")
             else:
                 raise ValueError("Invalid export_type parameter value. Valid values are: 'html/csv/xml/pdf'")
-            url = self.url_joiner(url=self.url, path=f"spaces/doexportspace.action?key={space_key}")
+            url = ui_url(f"spaces/doexportspace.action?key={space_key}")
 
             # Sending a POST request that triggers the space export.
-            response = self.session.post(url, headers=self.form_token_headers, data=form_data)
+            response = self.session.post(
+                url,
+                headers=self.form_token_headers,
+                data=form_data,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+                proxies=self.proxies,
+            )
+            response.raise_for_status()
             parsed_html = BeautifulSoup(response.text, "html.parser")
             # Getting the poll URL to get the export progress status
             try:
@@ -3034,21 +3553,15 @@ class Server(ConfluenceServerBase):
             running_task = True
             while running_task:
                 try:
-                    progress_response = self.get(poll_url) or {}
+                    progress_url = urljoin(ui_base_url + "/", poll_url)
+                    progress_response = self.get(progress_url, absolute=True) or {}
                     log.info(f"Space {space_key} export status: {progress_response.get('message', 'None')}")
                     if progress_response is not {} and progress_response.get("complete"):
                         parsed_html = BeautifulSoup(progress_response.get("message"), "html.parser")
                         download_url = cast(
                             "str", parsed_html.find("a", {"class": "space-export-download-path"}).get("href")
                         )  # type: ignore
-                        if self.url in download_url:
-                            return download_url
-                        else:
-                            combined_url = self.url + download_url
-                            # Ensure only one /wiki is included in the path
-                            if combined_url.count("/wiki") > 1:
-                                combined_url = combined_url.replace("/wiki/wiki", "/wiki")
-                            return combined_url
+                        return urljoin(ui_base_url + "/", download_url)
                     time.sleep(30)
                 except Exception as e:
                     raise ApiError(
@@ -3058,6 +3571,22 @@ class Server(ConfluenceServerBase):
             return "None"  # Return None if the while loop does not return a value
         except Exception as e:
             raise ApiError("Encountered error during space export from space " + space_key, reason=e)
+
+    def iter_space_exports(self, space_keys, export_type: str):
+        """Yield exported-space download URLs one space at a time.
+
+        The underlying Confluence export is an asynchronous browser workflow.
+        Confluence limits concurrent exports, so this iterator intentionally
+        waits for each export to finish before starting the next one. It is a
+        safer alternative to invoking :meth:`get_space_export` concurrently
+        from multiple threads.
+
+        :param space_keys: Iterable of Confluence space keys.
+        :param export_type: Export type accepted by :meth:`get_space_export`.
+        :return: Iterator of ``(space_key, download_url)`` tuples.
+        """
+        for space_key in space_keys:
+            yield space_key, self.get_space_export(space_key, export_type)
 
     def export_page(self, page_id):
         """
@@ -3962,6 +4491,8 @@ class Server(ConfluenceServerBase):
         """
         Returns the license detailed information
         """
+        if self.cloud:
+            raise ApiNotAcceptable("Confluence Cloud does not provide license details through this API")
         url = "rest/license/1.0/license/details"
         return self.get(url)
 
@@ -3969,6 +4500,8 @@ class Server(ConfluenceServerBase):
         """
         Returns the total used seats in the license
         """
+        if self.cloud:
+            raise ApiNotAcceptable("Confluence Cloud does not provide license details through this API")
         url = "rest/license/1.0/license/userCount"
         return self.get(url)
 
@@ -3976,6 +4509,8 @@ class Server(ConfluenceServerBase):
         """
         Returns the available license seats remaining
         """
+        if self.cloud:
+            raise ApiNotAcceptable("Confluence Cloud does not provide license details through this API")
         url = "rest/license/1.0/license/remainingSeats"
         return self.get(url)
 
@@ -3983,5 +4518,7 @@ class Server(ConfluenceServerBase):
         """
         Returns the license max users
         """
+        if self.cloud:
+            raise ApiNotAcceptable("Confluence Cloud does not provide license details through this API")
         url = "rest/license/1.0/license/maxUsers"
         return self.get(url)

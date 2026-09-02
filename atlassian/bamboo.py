@@ -82,7 +82,10 @@ class Bamboo(AtlassianRestAPI):
         if clover_enabled:
             flags.append("cloverEnabled")
         if label:
-            params["label"] = label
+            # Requests serializes a sequence value as repeated query
+            # parameters (``label=one&label=two``), which is the Bamboo REST
+            # API representation for filtering by multiple labels.
+            params["label"] = label if isinstance(label, str) else list(label)
         params.update(kwargs)
         if "elements_key" in kwargs and "element_key" in kwargs:
             return self._get_generator(
@@ -226,6 +229,59 @@ class Bamboo(AtlassianRestAPI):
             params["expand"] = expand
         resource = f"rest/api/latest/plan/{plan_key}"
         return self.get(resource, params=params)
+
+    def get_plan_specs(self, plan_key, package=None, format="YAML"):
+        """Export a plan as Bamboo Specs source code.
+
+        Bamboo does not provide a repositories-only REST endpoint. The
+        response's ``spec.code`` field contains the plan definition, including
+        its ``repositories`` section. ``YAML`` is the most convenient format
+        for repository audits; Bamboo also supports ``JAVA`` on compatible
+        releases.
+
+        :param plan_key: Full plan key, for example ``PROJECT-PLAN``.
+        :param package: Optional Java package name when exporting Java Specs.
+        :param format: Export format, normally ``YAML`` or ``JAVA``.
+        :return: The ``RestPlanSpec`` response containing ``spec.code``.
+        """
+        params = {"format": format}
+        if package is not None:
+            params["package"] = package
+        return self.get(self.resource_url(f"plan/{plan_key}/specs"), params=params)
+
+    def search_linked_repositories(self, search_term=None):
+        """Search globally configured Bamboo linked repositories.
+
+        The public Bamboo REST API can search existing linked repositories but
+        does not create or update their connection configuration. Create those
+        connections in Bamboo administration, then use the returned repository
+        ID with :meth:`link_repository_to_project`.
+
+        :param search_term: Optional repository-name fragment.
+        :return: Bamboo's paged linked-repository response.
+        """
+        params = {}
+        if search_term is not None:
+            params["searchTerm"] = search_term
+        return self.get(self.resource_url("repository"), params=params)
+
+    def get_project_linked_repositories(self, project_key):
+        """Return linked repositories authorized for Bamboo Specs in a project."""
+        return self.get(self.resource_url(f"project/{project_key}/repository"))
+
+    def link_repository_to_project(self, project_key, repository_id):
+        """Authorize an existing linked repository for Bamboo Specs in a project.
+
+        This grants a repository-stored Bamboo Specs repository permission to
+        create or edit plans in ``project_key``. It does not change the
+        repositories checked out by an existing plan; update and apply that
+        plan's Bamboo Specs for plan-level repository changes.
+        """
+        return self.post(self.resource_url(f"project/{project_key}/repository"), data={"id": repository_id})
+
+    def unlink_repository_from_project(self, project_key, repository_id):
+        """Remove a project-level Bamboo Specs repository authorization."""
+        return self.delete(self.resource_url(f"project/{project_key}/repository/{repository_id}"))
 
     def search_plans(self, search_term, fuzzy=True, start_index=0, max_results=25):
         """
@@ -397,6 +453,7 @@ class Bamboo(AtlassianRestAPI):
         start_index=0,
         max_results=25,
         include_all_states=False,
+        build_state=None,
     ):
         """
         Get results as generic method
@@ -408,10 +465,12 @@ class Bamboo(AtlassianRestAPI):
         :param favourite:
         :param clover_enabled:
         :param issue_key:
-        :param label:
+        :param label: A label string or an iterable of labels.
         :param start_index:
         :param max_results:
         :param include_all_states:
+        :param build_state: Optional Bamboo result state, such as
+            ``Successful`` or ``Failed``.
         :return:
         """
         resource = "result"
@@ -429,6 +488,8 @@ class Bamboo(AtlassianRestAPI):
             params["issueKey"] = issue_key
         if include_all_states:
             params["includeAllStates"] = include_all_states
+        if build_state is not None:
+            params["buildstate"] = build_state
         return self.base_list_call(
             resource,
             expand=expand,
@@ -525,6 +586,7 @@ class Bamboo(AtlassianRestAPI):
         start_index=0,
         max_results=25,
         include_all_states=False,
+        build_state=None,
     ):
         """
         Get Plan results
@@ -538,6 +600,8 @@ class Bamboo(AtlassianRestAPI):
         :param start_index:
         :param max_results:
         :param include_all_states:
+        :param build_state: Optional Bamboo result state, such as
+            ``Successful`` or ``Failed``.
         :return:
         """
         return self.results(
@@ -551,7 +615,70 @@ class Bamboo(AtlassianRestAPI):
             start_index=start_index,
             max_results=max_results,
             include_all_states=include_all_states,
+            build_state=build_state,
         )
+
+    def ordered_plan_results(
+        self,
+        project_key,
+        plan_key,
+        order="descending",
+        build_state=None,
+        max_results=25,
+        **kwargs,
+    ):
+        """Return retrieved plan results ordered by completion time.
+
+        Bamboo's result API does not expose a server-side sort parameter. This
+        helper orders the result page client-side by ``buildCompletedTime``.
+        Set ``max_results`` high enough to include the history being compared;
+        this method returns a list rather than the lazy generator returned by
+        :meth:`plan_results`.
+
+        :param order: ``"ascending"`` for oldest first or ``"descending"``
+            for newest first.
+        :param build_state: Optional ``Successful`` or ``Failed`` filter.
+        :param max_results: Number of results Bamboo should return to sort.
+        :return: A list of build results ordered by completion time.
+        """
+        if order not in {"ascending", "descending"}:
+            raise ValueError("order must be 'ascending' or 'descending'")
+
+        results = self.plan_results(
+            project_key,
+            plan_key,
+            build_state=build_state,
+            max_results=max_results,
+            **kwargs,
+        )
+        return sorted(
+            results,
+            key=lambda result: result.get("buildCompletedTime") or "",
+            reverse=order == "descending",
+        )
+
+    def latest_successful_plan_result(self, project_key, plan_key, max_results=25, **kwargs):
+        """Return the newest successful plan result, or ``None`` when absent."""
+        results = self.ordered_plan_results(
+            project_key,
+            plan_key,
+            build_state="Successful",
+            max_results=max_results,
+            **kwargs,
+        )
+        return results[0] if results else None
+
+    def oldest_failed_plan_result(self, project_key, plan_key, max_results=25, **kwargs):
+        """Return the oldest failed plan result, or ``None`` when absent."""
+        results = self.ordered_plan_results(
+            project_key,
+            plan_key,
+            order="ascending",
+            build_state="Failed",
+            max_results=max_results,
+            **kwargs,
+        )
+        return results[0] if results else None
 
     def build_result(
         self,
@@ -653,6 +780,23 @@ class Bamboo(AtlassianRestAPI):
                 params[f"bamboo.variable.{key}"] = value
 
         return self.post(self.resource_url(resource), params=params)
+
+    def queue_build(self, plan_key, params=None):
+        """Add a plan to the Bamboo build queue.
+
+        ``params`` maps directly to Bamboo's queue request parameters. For
+        example, pass ``{"bamboo.variable.release": "1.2.3"}`` to set a
+        custom plan variable. Builds execute all stages by default; provide an
+        explicit ``executeAllStages`` or ``stage`` value to override that
+        behavior. The supplied mapping is never modified.
+
+        :param plan_key: Full plan key, for example ``PROJECT-PLAN``.
+        :param params: Optional queue parameters and custom variables.
+        :return: The queued build response.
+        """
+        queue_params = dict(params or {})
+        queue_params.setdefault("executeAllStages", "true")
+        return self.post(self.resource_url(f"queue/{plan_key}"), params=queue_params)
 
     def stop_build(self, plan_key):
         """
@@ -932,7 +1076,7 @@ class Bamboo(AtlassianRestAPI):
         """
         params = {"limit": limit, "start": start}
         if filter_users:
-            params = {"filter": filter_users}
+            params["filter"] = filter_users
         url = f"rest/api/latest/admin/groups/{group_name}/more-members"
         return self.get(url, params=params)
 
@@ -948,7 +1092,7 @@ class Bamboo(AtlassianRestAPI):
         """
         params = {"limit": limit, "start": start}
         if filter_users:
-            params = {"filter": filter_users}
+            params["filter"] = filter_users
 
         url = f"rest/api/latest/admin/groups/{group_name}/more-non-members"
         return self.get(url, params=params)
@@ -1203,8 +1347,57 @@ class Bamboo(AtlassianRestAPI):
             params={"includeShared": include_shared},
         )
 
-    def activity(self):
-        return self.get("build/admin/ajax/getDashboardSummary.action")
+    def add_agent_capability(self, agent_id, data):
+        """Add a capability to an agent using Bamboo's capability payload."""
+        return self.post(self.resource_url(f"agent/{agent_id}/capability"), data=data)
+
+    def delete_agent_capability(self, agent_id, capability_key):
+        """Delete one agent capability by its Bamboo capability key."""
+        return self.delete(self.resource_url(f"agent/{agent_id}/capability/{capability_key}"))
+
+    def delete_all_agent_capabilities(self, agent_id):
+        """Delete every capability assigned directly to an agent."""
+        return self.delete(self.resource_url(f"agent/{agent_id}/capability"))
+
+    def get_plan_variables(self, plan_key):
+        """Return variables configured for a plan."""
+        return self.get(self.resource_url(f"plan/{plan_key}/variable"))
+
+    def get_plan_variable(self, plan_key, variable_name):
+        """Return one plan variable by name."""
+        return self.get(self.resource_url(f"plan/{plan_key}/variable/{variable_name}"))
+
+    def create_plan_variable(self, plan_key, data):
+        """Create a plan variable from Bamboo's variable request body."""
+        return self.post(self.resource_url(f"plan/{plan_key}/variable"), data=data)
+
+    def update_plan_variable(self, plan_key, variable_name, data):
+        """Update a plan variable."""
+        return self.put(self.resource_url(f"plan/{plan_key}/variable/{variable_name}"), data=data)
+
+    def delete_plan_variable(self, plan_key, variable_name):
+        """Delete a plan variable."""
+        return self.delete(self.resource_url(f"plan/{plan_key}/variable/{variable_name}"))
+
+    def activity(self, busy=None):
+        """Return active online agents and their current build activity.
+
+        The former dashboard AJAX endpoint was an internal Bamboo UI endpoint
+        and is not present in current Bamboo releases.  The supported agent
+        REST resource exposes ``active`` and ``busy`` for each online agent.
+
+        :param busy: Optional filter for busy (``True``) or idle (``False``)
+                     agents. By default, return all active online agents.
+        :return: List of active agent dictionaries, including ``busy``.
+        """
+        agents = self.agent_status(online=True)
+        if not isinstance(agents, list):
+            return agents
+
+        active_agents = [agent for agent in agents if agent.get("active", agent.get("online", False))]
+        if busy is None:
+            return active_agents
+        return [agent for agent in active_agents if agent.get("busy") is busy]
 
     def get_custom_expiry(self, limit=25):
         """
@@ -1295,6 +1488,823 @@ class Bamboo(AtlassianRestAPI):
             # check as support tools
             response = self.get("rest/supportHealthCheck/1.0/check/")
         return response
+
+    """Responsibility"""
+
+    def get_broken_builds_by_user(self, username):
+        """
+        Get broken builds for which a user has taken responsibility.
+        :param username: str - username
+        :return: list of broken builds
+        """
+        return self.get(f"rest/responsibility/latest/brokenBuild/byUser/{username}")
+
+    def get_my_broken_builds(self):
+        """Get broken builds for which the current user has taken responsibility."""
+        return self.get("rest/responsibility/latest/brokenBuild/myBrokenBuilds")
+
+    def get_broken_build(self, plan_result_key_or_plan_key):
+        """
+        Get responsibility information for a broken build or plan.
+        :param plan_result_key_or_plan_key: str - plan result key or plan key
+        :return: responsibility info
+        """
+        return self.get(f"rest/responsibility/latest/brokenBuild/{plan_result_key_or_plan_key}")
+
+    def take_responsibility(self, plan_result_key_or_plan_key, username):
+        """
+        Take responsibility for a broken build.
+        :param plan_result_key_or_plan_key: str - plan result key or plan key
+        :param username: str - username taking responsibility
+        :return:
+        """
+        return self.post(f"rest/responsibility/latest/brokenBuild/{plan_result_key_or_plan_key}/{username}")
+
+    def remove_responsibility(self, plan_result_key_or_plan_key, username):
+        """
+        Remove responsibility for a broken build.
+        :param plan_result_key_or_plan_key: str - plan result key or plan key
+        :param username: str - username
+        :return:
+        """
+        return self.delete(f"rest/responsibility/latest/brokenBuild/{plan_result_key_or_plan_key}/{username}")
+
+    """Triggers"""
+
+    def remote_trigger_change_detection(self):
+        """Trigger remote repository change detection for all linked repositories."""
+        return self.post("rest/triggers/latest/remote/changeDetection")
+
+    """Access tokens"""
+
+    def get_access_tokens(self):
+        """Get all access tokens for the current user."""
+        return self.get(self.resource_url("access-token"))
+
+    def create_access_token(self):
+        """Create a new access token for the current user."""
+        return self.post(self.resource_url("access-token"))
+
+    def delete_access_token(self, token_id):
+        """
+        Delete an access token.
+        :param token_id: str - token id
+        :return:
+        """
+        return self.delete(self.resource_url(f"access-token/{token_id}"))
+
+    """Deployments"""
+
+    def create_deployment_project(self, data):
+        """
+        Create a new deployment project.
+        :param data: dict - deployment project representation
+        :return: created deployment project
+        """
+        return self.post(self.resource_url("deploy/project"), data=data)
+
+    def update_deployment_project(self, project_id, data):
+        """
+        Update a deployment project.
+        :param project_id: str - deployment project id
+        :param data: dict - deployment project representation
+        :return:
+        """
+        return self.put(self.resource_url(f"deploy/project/{project_id}"), data=data)
+
+    def create_deployment_environment(self, project_id, data):
+        """
+        Create a deployment environment in a deployment project.
+        :param project_id: str - deployment project id
+        :param data: dict - environment representation
+        :return: created environment
+        """
+        return self.post(self.resource_url(f"deploy/project/{project_id}/environment"), data=data)
+
+    def get_deployment_environment(self, environment_id):
+        """
+        Get a deployment environment.
+        :param environment_id: str - environment id
+        :return: environment
+        """
+        return self.get(self.resource_url(f"deploy/environment/{environment_id}"))
+
+    def update_deployment_environment(self, environment_id, data):
+        """
+        Update a deployment environment.
+        :param environment_id: str - environment id
+        :param data: dict - environment representation
+        :return:
+        """
+        return self.put(self.resource_url(f"deploy/environment/{environment_id}"), data=data)
+
+    def delete_deployment_environment(self, environment_id):
+        """
+        Delete a deployment environment.
+        :param environment_id: str - environment id
+        :return:
+        """
+        return self.delete(self.resource_url(f"deploy/environment/{environment_id}"))
+
+    def get_deployment_versions(self, project_id, start=0, limit=25):
+        """
+        Get versions for a deployment project.
+        :param project_id: str - deployment project id
+        :param start: int - start index for paging
+        :param limit: int - maximum number of results
+        :return: versions
+        """
+        return self.get(
+            self.resource_url(f"deploy/project/{project_id}/versions"),
+            params={"start": start, "limit": limit},
+        )
+
+    def create_deployment_version(self, project_id, data):
+        """
+        Create a deployment version.
+        :param project_id: str - deployment project id
+        :param data: dict - version representation
+        :return: created version
+        """
+        return self.post(self.resource_url(f"deploy/project/{project_id}/version"), data=data)
+
+    def get_deployment_version(self, version_id):
+        """
+        Get a deployment version.
+        :param version_id: str - version id
+        :return: version
+        """
+        return self.get(self.resource_url(f"deploy/version/{version_id}"))
+
+    def delete_deployment_version(self, version_id):
+        """
+        Delete a deployment version.
+        :param version_id: str - version id
+        :return:
+        """
+        return self.delete(self.resource_url(f"deploy/version/{version_id}"))
+
+    def get_deployment_dashboard_paginate(self, project_id=None, start=0, limit=25):
+        """
+        Get paginated deployment dashboard.
+        :param project_id: str - optional deployment project id
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: dashboard data
+        """
+        resource = f"deploy/dashboard/paginate/{project_id}" if project_id else "deploy/dashboard/paginate"
+        return self.get(self.resource_url(resource), params={"start": start, "limit": limit})
+
+    def get_deployment_dashboard_status(self, data):
+        """
+        Get deployment dashboard status for given environments.
+        :param data: dict - request body with environment ids
+        :return: dashboard status
+        """
+        return self.post(self.resource_url("deploy/dashboard/status"), data=data)
+
+    """Admin configuration"""
+
+    def _admin_url(self, resource):
+        return f"rest/admin/latest/{resource}"
+
+    def get_artifact_handler_config(self, handler_name):
+        """
+        Get configuration for an artifact handler.
+        :param handler_name: str - handler name (agentLocal, bambooRemote, s3, sftp)
+        :return: configuration
+        """
+        return self.get(self._admin_url(f"artifactHandlers/{handler_name}"))
+
+    def update_artifact_handler_config(self, handler_name, data):
+        """
+        Update configuration for an artifact handler.
+        :param handler_name: str - handler name
+        :param data: dict - handler configuration
+        :return:
+        """
+        return self.put(self._admin_url(f"artifactHandlers/{handler_name}"), data=data)
+
+    def get_agent_config(self):
+        """Get agent configuration list."""
+        return self.get(self._admin_url("config/agents"))
+
+    def get_offline_agent_removal_config(self):
+        """Get offline agent removal configuration."""
+        return self.get(self._admin_url("config/agents/offlineAgentRemoval"))
+
+    def update_offline_agent_removal_config(self, data):
+        """
+        Update offline agent removal configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/agents/offlineAgentRemoval"), data=data)
+
+    def get_build_concurrency_config(self):
+        """Get build concurrency configuration."""
+        return self.get(self._admin_url("config/build/concurrency"))
+
+    def update_build_concurrency_config(self, data):
+        """
+        Update build concurrency configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/build/concurrency"), data=data)
+
+    def get_build_monitoring_config(self):
+        """Get build monitoring configuration."""
+        return self.get(self._admin_url("config/build/monitoring"))
+
+    def update_build_monitoring_config(self, data):
+        """
+        Update build monitoring configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/build/monitoring"), data=data)
+
+    def get_general_config(self):
+        """Get general configuration."""
+        return self.get(self._admin_url("config/general"))
+
+    def update_general_config(self, data):
+        """
+        Update general configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/general"), data=data)
+
+    def get_mail_server_config(self):
+        """Get mail server configuration."""
+        return self.get(self._admin_url("config/mailServer"))
+
+    def update_mail_server_config(self, data):
+        """
+        Update mail server configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/mailServer"), data=data)
+
+    def delete_mail_server_config(self):
+        """Delete mail server configuration."""
+        return self.delete(self._admin_url("config/mailServer"))
+
+    def get_im_server_config(self):
+        """Get instant messaging server configuration."""
+        return self.get(self._admin_url("config/imServer"))
+
+    def update_im_server_config(self, data):
+        """
+        Update instant messaging server configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/imServer"), data=data)
+
+    def delete_im_server_config(self):
+        """Delete instant messaging server configuration."""
+        return self.delete(self._admin_url("config/imServer"))
+
+    def get_remote_agent_support_config(self):
+        """Get remote agent support configuration."""
+        return self.get(self._admin_url("config/remoteAgentSupport"))
+
+    def update_remote_agent_support_config(self, data):
+        """
+        Update remote agent support configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/remoteAgentSupport"), data=data)
+
+    def get_quarantine_config(self):
+        """Get quarantine configuration."""
+        return self.get(self._admin_url("config/quarantine"))
+
+    def update_quarantine_config(self, data):
+        """
+        Update quarantine configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/quarantine"), data=data)
+
+    def get_audit_log_config(self):
+        """Get audit log configuration."""
+        return self.get(self._admin_url("config/auditLog"))
+
+    def update_audit_log_config(self, data):
+        """
+        Update audit log configuration.
+        :param data: dict - configuration
+        :return:
+        """
+        return self.put(self._admin_url("config/auditLog"), data=data)
+
+    def get_dark_features(self):
+        """Get all dark features."""
+        return self.get(self._admin_url("darkFeatures"))
+
+    def get_dark_feature(self, key):
+        """
+        Get a dark feature.
+        :param key: str - feature key
+        :return: feature status
+        """
+        return self.get(self._admin_url(f"darkFeatures/{key}"))
+
+    def update_dark_feature(self, key, enabled):
+        """
+        Enable or disable a dark feature.
+        :param key: str - feature key
+        :param enabled: bool - enabled status
+        :return:
+        """
+        return self.put(self._admin_url(f"darkFeatures/{key}"), data={"enabled": enabled})
+
+    def get_dark_feature_user(self, key, username):
+        """
+        Get dark feature status for a user.
+        :param key: str - feature key
+        :param username: str - username
+        :return: feature status
+        """
+        return self.get(self._admin_url(f"darkFeatures/{key}/user/{username}"))
+
+    def update_dark_feature_user(self, key, username, enabled):
+        """
+        Enable or disable a dark feature for a user.
+        :param key: str - feature key
+        :param username: str - username
+        :param enabled: bool - enabled status
+        :return:
+        """
+        return self.put(self._admin_url(f"darkFeatures/{key}/user/{username}"), data={"enabled": enabled})
+
+    def get_global_variables(self):
+        """Get all global variables."""
+        return self.get(self._admin_url("globalVariables"))
+
+    def create_global_variable(self, data):
+        """
+        Create a global variable.
+        :param data: dict - variable representation
+        :return: created variable
+        """
+        return self.post(self._admin_url("globalVariables"), data=data)
+
+    def get_global_variable(self, variable_id):
+        """
+        Get a global variable.
+        :param variable_id: str - variable id
+        :return: variable
+        """
+        return self.get(self._admin_url(f"globalVariables/{variable_id}"))
+
+    def update_global_variable(self, variable_id, data):
+        """
+        Update a global variable.
+        :param variable_id: str - variable id
+        :param data: dict - variable representation
+        :return:
+        """
+        return self.put(self._admin_url(f"globalVariables/{variable_id}"), data=data)
+
+    def delete_global_variable(self, variable_id):
+        """
+        Delete a global variable.
+        :param variable_id: str - variable id
+        :return:
+        """
+        return self.delete(self._admin_url(f"globalVariables/{variable_id}"))
+
+    def verify_global_variables(self, data):
+        """
+        Verify global variables.
+        :param data: dict - variables to verify
+        :return: verification result
+        """
+        return self.put(self._admin_url("globalVariables/verify"), data=data)
+
+    def get_security_settings(self):
+        """Get security settings."""
+        return self.get(self._admin_url("security/settings"))
+
+    def update_security_settings(self, data):
+        """
+        Update security settings.
+        :param data: dict - security settings
+        :return:
+        """
+        return self.put(self._admin_url("security/settings"), data=data)
+
+    def get_security_groups(self):
+        """Get security groups."""
+        return self.get(self._admin_url("security/groups"))
+
+    def create_security_group(self, data):
+        """
+        Create a security group.
+        :param data: dict - group representation
+        :return: created group
+        """
+        return self.post(self._admin_url("security/groups"), data=data)
+
+    def get_trusted_keys(self):
+        """Get trusted keys."""
+        return self.get(self._admin_url("security/trustedKey"))
+
+    def add_trusted_key(self, data):
+        """
+        Add a trusted key.
+        :param data: dict - key representation
+        :return: created key
+        """
+        return self.post(self._admin_url("security/trustedKey"), data=data)
+
+    def delete_trusted_key(self, key_id):
+        """
+        Delete a trusted key.
+        :param key_id: str - key id
+        :return:
+        """
+        return self.delete(self._admin_url(f"security/trustedKey/{key_id}"))
+
+    """Permissions"""
+
+    def _permission_url(self, resource_type, resource_id):
+        return f"permissions/{resource_type}/{resource_id}"
+
+    def get_available_users_for_permission(self, resource_type, resource_id, start=0, limit=25):
+        """
+        Get users available for granting permission to a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: available users
+        """
+        return self.get(
+            self.resource_url(self._permission_url(resource_type, resource_id) + "/available-users"),
+            params={"start": start, "limit": limit},
+        )
+
+    def get_available_groups_for_permission(self, resource_type, resource_id, start=0, limit=25):
+        """
+        Get groups available for granting permission to a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: available groups
+        """
+        return self.get(
+            self.resource_url(self._permission_url(resource_type, resource_id) + "/available-groups"),
+            params={"start": start, "limit": limit},
+        )
+
+    def get_roles_for_permission(self, resource_type, resource_id):
+        """
+        Get roles with permissions for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :return: roles
+        """
+        return self.get(self.resource_url(self._permission_url(resource_type, resource_id) + "/roles"))
+
+    def grant_role_permission(self, resource_type, resource_id, role_name, permissions):
+        """
+        Grant permissions to a role for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param role_name: str - role name
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.put(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/roles/{role_name}"),
+            data=permissions,
+        )
+
+    def revoke_role_permission(self, resource_type, resource_id, role_name, permissions):
+        """
+        Revoke permissions from a role for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param role_name: str - role name
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.delete(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/roles/{role_name}"),
+            data=permissions,
+        )
+
+    def get_permission_users(self, resource_type, resource_id, filter_name=None, start=0, limit=25):
+        """
+        Get users with explicit permissions to a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param filter_name: str - optional name filter
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: users
+        """
+        params = {"start": start, "limit": limit}
+        if filter_name:
+            params["name"] = filter_name
+        return self.get(
+            self.resource_url(self._permission_url(resource_type, resource_id) + "/users"),
+            params=params,
+        )
+
+    def grant_user_permission(self, resource_type, resource_id, user_name, permissions):
+        """
+        Grant permissions to a user for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param user_name: str - username
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.put(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/users/{user_name}"),
+            data=permissions,
+        )
+
+    def revoke_user_permission(self, resource_type, resource_id, user_name, permissions):
+        """
+        Revoke permissions from a user for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param user_name: str - username
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.delete(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/users/{user_name}"),
+            data=permissions,
+        )
+
+    def get_permission_groups(self, resource_type, resource_id, filter_name=None, start=0, limit=25):
+        """
+        Get groups with explicit permissions to a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param filter_name: str - optional name filter
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: groups
+        """
+        params = {"start": start, "limit": limit}
+        if filter_name:
+            params["name"] = filter_name
+        return self.get(
+            self.resource_url(self._permission_url(resource_type, resource_id) + "/groups"),
+            params=params,
+        )
+
+    def grant_group_permission(self, resource_type, resource_id, group_name, permissions):
+        """
+        Grant permissions to a group for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param group_name: str - group name
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.put(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/groups/{group_name}"),
+            data=permissions,
+        )
+
+    def revoke_group_permission(self, resource_type, resource_id, group_name, permissions):
+        """
+        Revoke permissions from a group for a resource.
+        :param resource_type: str - deployment, environment, project, plan, repository
+        :param resource_id: str - resource id
+        :param group_name: str - group name
+        :param permissions: list - list of permissions
+        :return:
+        """
+        return self.delete(
+            self.resource_url(self._permission_url(resource_type, resource_id) + f"/groups/{group_name}"),
+            data=permissions,
+        )
+
+    """Admin users and groups"""
+
+    def get_users(self, start=0, limit=25):
+        """
+        Get a paginated list of users.
+        :param start: int - start index
+        :param limit: int - maximum number of results
+        :return: users
+        """
+        return self.get(self.resource_url("admin/users"), params={"start": start, "limit": limit})
+
+    def create_user(self, data):
+        """
+        Create a new user.
+        :param data: dict - user representation
+        :return: created user
+        """
+        return self.post(self.resource_url("admin/users"), data=data)
+
+    def delete_user(self, username):
+        """
+        Delete a user.
+        :param username: str - username
+        :return:
+        """
+        return self.delete(self.resource_url(f"admin/users/{username}"))
+
+    def update_user_credentials(self, data):
+        """
+        Update user credentials.
+        :param data: dict - credentials request
+        :return:
+        """
+        return self.put(self.resource_url("admin/users/credentials"), data=data)
+
+    def rename_user(self, data):
+        """
+        Rename a user.
+        :param data: dict - rename request
+        :return:
+        """
+        return self.put(self.resource_url("admin/users/rename"), data=data)
+
+    def get_user_access_tokens(self, username):
+        """
+        Get access tokens for a user.
+        :param username: str - username
+        :return: access tokens
+        """
+        return self.get(self.resource_url(f"admin/users/{username}/access-token"))
+
+    def delete_user_access_token(self, username, token_id):
+        """
+        Delete an access token for a user.
+        :param username: str - username
+        :param token_id: str - token id
+        :return:
+        """
+        return self.delete(self.resource_url(f"admin/users/{username}/access-token/{token_id}"))
+
+    def get_user_alias(self, username):
+        """
+        Get a user's alias.
+        :param username: str - username
+        :return: alias
+        """
+        return self.get(self.resource_url(f"admin/users/{username}/alias"))
+
+    def set_user_alias(self, username, data):
+        """
+        Set a user's alias.
+        :param username: str - username
+        :param data: dict - alias request
+        :return:
+        """
+        return self.post(self.resource_url(f"admin/users/{username}/alias"), data=data)
+
+    def delete_user_alias(self, username):
+        """
+        Delete a user's alias.
+        :param username: str - username
+        :return:
+        """
+        return self.delete(self.resource_url(f"admin/users/{username}/alias"))
+
+    """Server and queue"""
+
+    def get_server(self):
+        """Get Bamboo server information."""
+        return self.get(self.resource_url("server"))
+
+    def get_server_nodes(self):
+        """Get Bamboo server nodes."""
+        return self.get(self.resource_url("server/nodes"))
+
+    def pause_server(self):
+        """Pause the Bamboo server."""
+        return self.post(self.resource_url("server/pause"))
+
+    def resume_server(self):
+        """Resume the Bamboo server."""
+        return self.post(self.resource_url("server/resume"))
+
+    def prepare_for_restart(self):
+        """Prepare the Bamboo server for restart."""
+        return self.put(self.resource_url("server/prepareForRestart"))
+
+    def get_current_user(self):
+        """Get information about the current user."""
+        return self.get(self.resource_url("currentUser"))
+
+    def remove_build_from_queue(self, project_key, build_key, build_number):
+        """
+        Remove a build from the queue.
+        :param project_key: str - project key
+        :param build_key: str - build key
+        :param build_number: int - build number
+        :return:
+        """
+        return self.delete(self.resource_url(f"queue/{project_key}-{build_key}-{build_number}"))
+
+    def pause_build_in_queue(self, project_key, build_key, build_number):
+        """
+        Pause a build in the queue.
+        :param project_key: str - project key
+        :param build_key: str - build key
+        :param build_number: int - build number
+        :return:
+        """
+        return self.put(self.resource_url(f"queue/{project_key}-{build_key}-{build_number}"))
+
+    def remove_deployment_from_queue(self, deployment_result_id):
+        """
+        Remove a deployment from the queue.
+        :param deployment_result_id: str - deployment result id
+        :return:
+        """
+        return self.delete(self.resource_url(f"queue/deployment/{deployment_result_id}"))
+
+    """Quick filters"""
+
+    def get_quick_filters(self):
+        """Get all quick filters."""
+        return self.get(self.resource_url("quickFilter"))
+
+    def create_quick_filter(self, data):
+        """
+        Create a quick filter.
+        :param data: dict - filter representation
+        :return: created filter
+        """
+        return self.post(self.resource_url("quickFilter"), data=data)
+
+    def get_active_quick_filters(self):
+        """Get active quick filters."""
+        return self.get(self.resource_url("quickFilter/active"))
+
+    def get_visible_quick_filters(self):
+        """Get visible quick filters."""
+        return self.get(self.resource_url("quickFilter/visible"))
+
+    def set_visible_quick_filters(self, data):
+        """
+        Set visible quick filters.
+        :param data: dict - filter ids
+        :return:
+        """
+        return self.put(self.resource_url("quickFilter/visible"), data=data)
+
+    def deactivate_quick_filters(self, data):
+        """
+        Deactivate quick filters.
+        :param data: dict - filter ids
+        :return:
+        """
+        return self.put(self.resource_url("quickFilter/deactivate"), data=data)
+
+    def get_quick_filter(self, filter_id):
+        """
+        Get a quick filter.
+        :param filter_id: str - filter id
+        :return: filter
+        """
+        return self.get(self.resource_url(f"quickFilter/{filter_id}"))
+
+    def update_quick_filter(self, filter_id, data):
+        """
+        Update a quick filter.
+        :param filter_id: str - filter id
+        :param data: dict - filter representation
+        :return:
+        """
+        return self.put(self.resource_url(f"quickFilter/{filter_id}"), data=data)
+
+    def delete_quick_filter(self, filter_id):
+        """
+        Delete a quick filter.
+        :param filter_id: str - filter id
+        :return:
+        """
+        return self.delete(self.resource_url(f"quickFilter/{filter_id}"))
+
+    def activate_quick_filter(self, filter_id):
+        """
+        Activate a quick filter.
+        :param filter_id: str - filter id
+        :return:
+        """
+        return self.put(self.resource_url(f"quickFilter/{filter_id}/activate"))
 
     """Elastic Bamboo"""
 

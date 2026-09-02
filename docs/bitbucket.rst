@@ -1,6 +1,159 @@
 BitBucket module
 ================
 
+Complete API reference
+----------------------
+
+The workflow sections below cover common operations. The source-backed
+references list every public method and current signature for the compatible,
+Cloud OO, and Server/Data Center clients.
+
+.. autoclass:: atlassian.bitbucket.Bitbucket
+   :members:
+   :undoc-members:
+
+.. autoclass:: atlassian.bitbucket.cloud.Cloud
+   :members:
+   :undoc-members:
+
+.. autoclass:: atlassian.bitbucket.server.Server
+   :members:
+   :undoc-members:
+
+Server/Data Center pagination
+-----------------------------
+
+Several Server/Data Center methods return Python generators, including
+``project_list()``, ``repo_list()``, ``repo_all_list()``, and
+``get_pull_requests()``. Iterate them to process every page lazily, or wrap
+them in ``list`` only when the entire result is small enough to hold in memory.
+Generators do not have a ``.json()`` method because each yielded value is
+already a Python dictionary.
+
+.. code-block:: python
+
+    for repository in bitbucket.repo_all_list("PROJ"):
+        for pull_request in bitbucket.get_pull_requests("PROJ", repository["slug"], state="OPEN"):
+            print(pull_request["title"])
+
+``advanced_mode=True`` is for callers that need raw ``requests.Response``
+objects from individual requests. Do not enable it for the high-level paginated
+methods above; use their yielded dictionaries instead.
+
+Personal repositories (Server/Data Center)
+------------------------------------------
+
+Repository methods accept a personal-project user slug in place of a project
+key. Prefix the Bitbucket username with ``~`` and the legacy client uses the
+user-centric ``/users/{userSlug}/repos/{repositorySlug}`` endpoint. This works
+for pull-request settings and every other repository method that accepts
+``project_key`` and ``repository_slug``.
+
+.. code-block:: python
+
+    owner = "~alice"
+    settings = bitbucket.get_pull_request_settings(owner, "personal-repository")
+    bitbucket.set_pull_request_settings(owner, "personal-repository", settings)
+
+For the object-oriented Server/Data Center client, use
+``personal_repositories()``. It accepts either ``"alice"`` or ``"~alice"``.
+
+.. code-block:: python
+
+    from atlassian.bitbucket.server import Server
+
+    bitbucket = Server("https://bitbucket.example.com", username="admin", password="token")
+    repository = bitbucket.personal_repositories("alice").get("personal-repository")
+    print(repository.name)
+
+Hook scripts (Data Center 8+)
+-----------------------------
+
+Hook scripts are a Bitbucket Data Center feature, not Bitbucket Cloud. A system
+administrator first registers the global script, then a project or repository
+administrator configures the script for its target scope. Bitbucket Data Center
+8.18 and newer disable this feature by default; enable
+``feature.hook.scripts=true`` in ``bitbucket.properties`` and restart the
+cluster before use.
+
+.. code-block:: python
+
+    with open("hooks/audit-pushes.sh", "rb") as script_file:
+        hook_script = bitbucket.create_hook_script(
+            script_file.read(),
+            name="Audit pushes",
+            hook_type="POST",  # or "PRE"
+            description="Records every push",
+        )
+
+    bitbucket.configure_project_hook_script(
+        "PROJ", hook_script["id"], trigger_ids=["repo:refs_changed"]
+    )
+    bitbucket.configure_repo_hook_script(
+        "PROJ", "repository", hook_script["id"], trigger_ids=["repo:refs_changed"]
+    )
+
+``get_project_hook_scripts()`` and ``get_repo_hook_scripts()`` yield all
+configured scripts. ``delete_project_hook_script()`` and
+``delete_repo_hook_script()`` remove only a scope configuration; they do not
+delete the global registered script.
+
+The global registered script itself is managed with the server-level methods.
+``get_hook_script()`` returns a script's metadata, ``get_hook_script_content()``
+returns its raw body, ``update_hook_script()`` replaces its body or metadata,
+and ``delete_hook_script()`` removes it entirely:
+
+.. code-block:: python
+
+    metadata = bitbucket.get_hook_script(hook_script["id"])
+    script = bitbucket.get_hook_script_content(hook_script["id"])
+
+    bitbucket.update_hook_script(
+        hook_script["id"],
+        content=script.replace(b"old", b"new"),
+        name="Audit pushes (v2)",
+        hook_type="POST",
+        description="Records every push",
+    )
+    bitbucket.delete_hook_script(hook_script["id"])
+
+Release report from two refs (Server/Data Center)
+-------------------------------------------------
+
+To report merged pull requests between two release tags or commit hashes, first
+iterate ``get_changelog()`` and then resolve the pull requests associated with
+each returned commit. A pull request can be associated with multiple commits,
+so retain the results by pull request ID to avoid duplicates.
+
+.. code-block:: python
+
+    merged_pull_requests = {}
+    for commit in bitbucket.get_changelog("PROJ", "repository", "refs/tags/v1.0", "refs/tags/v1.1"):
+        for pull_request in bitbucket.get_pull_requests_contain_commit("PROJ", "repository", commit["id"]):
+            if pull_request["state"] == "MERGED":
+                merged_pull_requests[pull_request["id"]] = pull_request
+
+    for pull_request in merged_pull_requests.values():
+        print(pull_request["title"])
+
+See ``examples/bitbucket/bitbucket_server_release_report.py`` for a complete
+environment-variable-based script.
+
+Commits belonging to an open pull request may not be reachable from the
+repository ref used by ``get_commits``. To retrieve the commits that belong to
+a specific pull request on Server/Data Center, query the pull-request commits
+endpoint instead:
+
+.. code-block:: python
+
+    for commit in bitbucket.get_pull_requests_commits("PROJ", "repository", pull_request_id):
+        print(commit["id"])
+
+The Cloud object model provides the equivalent operation as
+``repository.pullrequests.get(pull_request_id).commits``. Use
+``get_pull_requests_contain_commit`` when starting from an individual commit
+and looking up its associated pull requests.
+
 Manage projects
 ---------------
 
@@ -186,6 +339,13 @@ Manage code
     # The authenticated user must have PROJECT_ADMIN permission for the context project to call this resource.
     bitbucket.create_repo(project_key, repository, forkable=False, is_private=True)
 
+    # Bitbucket Server/Data Center: inspect or change whether a repository
+    # accepts forks. These calls require repository administration permission.
+    is_forkable = bitbucket.get_repo_forkable(project_key, repository)
+    bitbucket.set_repo_forkable(project_key, repository, forkable=True)
+    bitbucket.enable_repo_forking(project_key, repository)
+    bitbucket.disable_repo_forking(project_key, repository)
+
     # Get branches from repo
     bitbucket.get_branches(project, repository, filter='', limit=99999, details=True, boost_matches=False)
 
@@ -348,104 +508,204 @@ Conditions-Reviewers management
     # Delete a project condition for specific repository in project
     bitbucket.delete_repo_condition(project_key, repo_key, id_condition)
 
-Bitbucket Cloud
----------------
+For Bitbucket Server/Data Center, administrators can inspect cluster node
+information with the legacy client:
 
 .. code-block:: python
 
-    # Get a list of workplaces:
+    from atlassian import Bitbucket
+
+    bitbucket = Bitbucket(
+        url="https://bitbucket.example.com",
+        username="admin",
+        password="password",
+    )
+    cluster = bitbucket.get_cluster_info()
+
+Bitbucket Cloud
+---------------
+
+Bitbucket Cloud and Bitbucket Server/Data Center have different REST API
+models. Use :class:`atlassian.bitbucket.cloud.Cloud` for Cloud: it starts from
+``workspaces`` and then navigates to repositories. Use ``Bitbucket`` or
+:class:`atlassian.bitbucket.server.Server` for Server/Data Center project
+endpoints. Do not pass a Cloud URL to the legacy Server/Data Center methods.
+
+Use an Atlassian account email and a scoped Bitbucket API token with the
+required repository and workspace permissions. The client uses HTTP Basic
+authentication automatically. App passwords were retired by Bitbucket Cloud in
+July 2026, so new integrations must use API tokens.
+
+.. code-block:: python
+
+    import os
+
+    from atlassian.bitbucket import Cloud
+
+    cloud = Cloud(
+        username=os.environ["ATLASSIAN_EMAIL"],
+        password=os.environ["BITBUCKET_API_TOKEN"],
+    )
+
+    # /2.0/user/workspaces is the supported listing route. ``each()`` resolves
+    # each entry and yields full workspace objects.
+    for workspace in cloud.workspaces.each():
+        print(workspace.slug)
+
+    # Restrict the list to workspaces administered by the authenticated user.
+    admin_workspaces = list(cloud.workspaces.each(administrator=True))
+
+    repository = cloud.workspaces.get("workspace-slug").repositories.get("repository-slug")
+    print(repository.name)
+
+.. code-block:: python
+
+    # Get a list of workspaces.
     cloud.workspaces.each()
 
-    # Get a single workplace by workplace slug
-    workplace = cloud.workspaces.get(workspace_slug)
+    # Get a single workspace by workspace slug.
+    workspace = cloud.workspaces.get(workspace_slug)
 
     # Get a list of permissions in a workspace (this may not work depending on the size of your workspace)
-    workplace.permissions.each():
+    workspace.permissions.each()
 
     # Get a list of repository permissions in a workspace (this may not work depending on the size of your workspace)
-    workplace.permissions.repositories():
+    workspace.permissions.repositories()
 
     # Get a single repository permissions in a workspace
-    workplace.permissions.repositories(repo_slug):
+    workspace.permissions.repositories(repo_slug)
 
     # Get a list of projects in a workspace
-    workplace.projects.each():
+    workspace.projects.each()
 
-    # Get a single project from a workplace by project key
-    project = workplace.projects.get(project_key)
+    # Get a single project from a workspace by project key
+    project = workspace.projects.get(project_key)
 
     # Get a list of repos from a project
-    project.repositories.each():
+    project.repositories.each()
 
     # Get a repository
-    repository = workplace.repositories.get(repository_slug)
+    repository = workspace.repositories.get(repository_slug)
+
+    # Commit history supports include/exclude refs and a file-path filter.
+    commits = repository.commits.each(
+        include="main",
+        exclude="release",
+        path="src/app.py",
+    )
+    for commit in commits:
+        print(commit.hash)
+
+The Cloud commits endpoint does not support arbitrary ``q`` expressions for
+filtering by author or date. Filter those fields in the returned commits, or
+use ``include``, ``exclude`` and ``path`` when those server-side filters fit
+the use case.
+
+.. code-block:: python
+
+    # Read raw bytes from a file at a branch, tag, or commit SHA
+    readme = repository.get_source_file("main", "README.md")
+
+    # List directory entries at a branch, tag, or commit SHA
+    source_entries = repository.get_source_directory("main", "src")["values"]
 
     # Get a list of deployment environments from a repository
-    repository.deployment_environments.each():
+    repository.deployment_environments.each()
 
-    # Get a single deployment environment from a repository by deployment environment key
+    # Get a deployment environment by key
     deployment_environment = repository.deployment_environments.get(deployment_environment_key)
 
-    # Get a list of deployment environment variables from a deployment environment
-    deployment_environment_variables = deployment_environment.deployment_environment_variables.each():
+    # Get deployment environment variables from an environment
+    deployment_environment_variables = deployment_environment.deployment_environment_variables.each()
 
-    # Create a new deployment environment variable with a name of 'KEY', value of 'VALUE' and is not secured.
-    new_deployment_environment_variable = deployment_environment.deployment_environment_variables.create("KEY", "VALUE", False)
+    # Create a non-secured deployment environment variable.
+    new_deployment_environment_variable = deployment_environment.deployment_environment_variables.create(
+    "KEY", "VALUE", False
+    )
 
     # Update the 'key' field of repository_variable
-    updated_deployment_environment_variable = new_deployment_environment_variable.update(key="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_KEY")
+    updated_deployment_environment_variable = new_deployment_environment_variable.update(
+    key="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_KEY"
+    )
 
     # Update the 'value' field of repository_variable
-    updated_deployment_environment_variable = new_deployment_environment_variable.update(value="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_VALUE")
+    updated_deployment_environment_variable = new_deployment_environment_variable.update(
+    value="UPDATED_DEPLOYMENT_ENVIRONMENT_VARIABLE_VALUE"
+    )
 
     # Delete deployment environment variable
     updated_deployment_environment_variable.delete()
 
     # Get a list of group permissions from a repository
-    repository.group_permissions.each():
+    repository.group_permissions.each()
 
     # Get a single group permission from a repository by group slug
     repository.group_permissions.get(group_slug)
 
     # Get a list of repository variables from a repository
-    repository.repository_variables.each():
+    repository.repository_variables.each()
 
-    # Get a single repository variable from a repository by repository variable key
-    repository_variable = repository.repository_variables.get(repository_variable_key)
+    # Get a repository variable by key
+    repository_variable = repository.repository_variables.get(
+    repository_variable_key
+    )
 
-    # Create a new repository variable with a name of 'KEY', value of 'VALUE' and is not secured.
-    new_repository_variable = repository.repository_variables.create("KEY", "VALUE", False)
+    # Create a non-secured repository variable.
+    new_repository_variable = repository.repository_variables.create(
+    "KEY", "VALUE", False
+    )
 
     # Update the 'key' field of repository_variable
-    updated_repository_variable = repository_variable.update(key="UPDATED_REPOSITORY_VARIABLE_KEY")
+    updated_repository_variable = repository_variable.update(
+    key="UPDATED_REPOSITORY_VARIABLE_KEY"
+    )
 
     # Update the 'value' field of repository_variable
-    updated_repository_variable = repository_variable.update(value="UPDATED_REPOSITORY_VARIABLE_VALUE")
+    updated_repository_variable = repository_variable.update(
+    value="UPDATED_REPOSITORY_VARIABLE_VALUE"
+    )
 
     # Delete repository_variable
     repository_variable.delete()
 
+    # Look up a repository pipeline variable by its name; the returned object
+    # exposes its UUID and can be updated without constructing a URL manually.
+    repository_variable = repository.repository_variables.get_by_key("qww")
+    if repository_variable is not None:
+        print(repository_variable.uuid)
+        repository.repository_variables.update_by_key(
+            "qww",
+            "new-value",
+            secured=True,
+        )
+
     # Get a list of hooks from a repository
-    repository.hooks.each():
+    repository.hooks.each()
 
     # Create a hook for a repository
-    hook  = repo.hooks.create(url="endpoint-url", description="description", active=True, events=["a-repository-event"])
+    hook = repo.hooks.create(
+    url="endpoint-url", description="description", active=True,
+    events=["a-repository-event"]
+    )
 
     # Get a single hook for a repository
     hook = repo.hooks.get("a-webhook-id")
 
     # Update a specific hook for a repository
-    hook.update(url="endpoint-url", description="description", active=True, events=["a-repository-event"])
+    hook.update(
+    url="endpoint-url", description="description", active=True,
+    events=["a-repository-event"]
+    )
 
     # Delete a speicifc hook for a repository
     hook.delete()
 
     # Get a list of workspace members
-    workplace.members.each()
+    workspace.members.each()
 
     # Get a specific workspace member
-    workplace.members.get("a-user-account-id")
-    workplace.members.get("{a-user-uuid}")
+    workspace.members.get("a-user-account-id")
+    workspace.members.get("{a-user-uuid}")
 
 Pipelines management
 --------------------
@@ -459,8 +719,8 @@ Pipelines management
         # Get first ten Pipelines results for repository
         r.pipelines.each()
 
-        # Get twenty last Pipelines results for repository
-        r.pipelines.each(sort="-created_on", pagelen=20)
+        # Get Pipelines results for repository, newest first
+        r.pipelines.each(sort="-created_on")
 
         # Trigger default Pipeline on the latest revision of the master branch
         r.pipelines.trigger()
@@ -469,13 +729,13 @@ Pipelines management
         r.pipelines.trigger(branch="develop")
 
         # Trigger default Pipeline on a specific revision of the develop branch
-        r.pipelines.trigger(branch="develop", revision="<40-char hash>")
+        r.pipelines.trigger(branch="develop", commit="<40-char hash>")
 
         # Trigger specific Pipeline on a specific revision of the master branch
-        r.pipelines.trigger(revision="<40-char hash>", name="style-check")
+        r.pipelines.trigger(commit="<40-char hash>", pattern="style-check")
 
         # Trigger specific Pipeline of the master branch with specific variables
-        r.pipelines.trigger(name="style-check", variables=[{ "key": "var-name", "value": "var-value" }])
+        r.pipelines.trigger(pattern="style-check", variables=[{ "key": "var-name", "value": "var-value" }])
 
         # Get specific Pipeline by UUID
         pl = r.pipelines.get("{7d6c327d-6336-4721-bfeb-c24caf25045c}")

@@ -4,9 +4,12 @@ Test cases for Confluence Cloud API client.
 """
 
 import pytest
+import logging
 from unittest.mock import patch
 
 from atlassian.confluence import ConfluenceCloud
+from atlassian.confluence.cloud.cloud import ConfluenceCloud as ConfluenceCloudV2
+from atlassian.errors import ApiError
 
 
 @pytest.fixture
@@ -25,6 +28,20 @@ class TestConfluenceCloud:
         assert confluence.api_root == "wiki/api/v2"
         assert confluence.cloud is True
 
+    @patch.object(ConfluenceCloudV2, "get_page_by_id")
+    @patch.object(ConfluenceCloudV2, "put")
+    def test_update_page_does_not_log_and_swallow_api_errors(self, mock_put, mock_get_page, caplog):
+        confluence_cloud = ConfluenceCloudV2("https://test.atlassian.net", token="test-token")
+        mock_get_page.return_value = {"version": {"number": 3}}
+        error = RuntimeError("update failed")
+        mock_put.side_effect = error
+
+        with caplog.at_level(logging.ERROR, logger="atlassian.confluence.cloud.cloud"):
+            with pytest.raises(RuntimeError, match="update failed"):
+                confluence_cloud.update_page("123", title="Updated")
+
+        assert not caplog.records
+
     def test_init_custom_values(self):
         """Test ConfluenceCloud client initialization with custom values."""
         confluence = ConfluenceCloud(
@@ -33,6 +50,101 @@ class TestConfluenceCloud:
         # The class should respect custom values when provided
         assert confluence.api_version == "1"
         assert confluence.api_root == "custom/api/root"
+
+    def test_legacy_cloud_api_version_is_normalized(self):
+        with pytest.warns(DeprecationWarning):
+            confluence = ConfluenceCloud(url="https://test.atlassian.net", api_version="cloud")
+
+        assert confluence.api_version == "2"
+
+    @patch.object(ConfluenceCloud, "_get_paged")
+    def test_iter_cql_follows_all_result_pages(self, mock_get_paged, confluence_cloud):
+        mock_get_paged.return_value = iter([{"id": "1"}, {"id": "2"}])
+
+        assert list(confluence_cloud.iter_cql("type=page", limit=250)) == [{"id": "1"}, {"id": "2"}]
+        mock_get_paged.assert_called_once_with("content/search", params={"cql": "type=page", "limit": 250})
+
+    @patch.object(ConfluenceCloud, "get")
+    def test_cql_passes_the_nested_content_storage_expansion(self, mock_get, confluence_cloud):
+        confluence_cloud.cql("type=page", limit=25, expand="content.body.storage")
+
+        mock_get.assert_called_once_with(
+            "content/search", params={"cql": "type=page", "limit": 25, "expand": "content.body.storage"}
+        )
+
+    @patch.object(ConfluenceCloud, "iter_cql")
+    def test_cql_all_materializes_iter_cql_results(self, mock_iter_cql, confluence_cloud):
+        mock_iter_cql.return_value = iter([{"id": "1"}, {"id": "2"}])
+
+        assert confluence_cloud.cql_all("type=page") == [{"id": "1"}, {"id": "2"}]
+        mock_iter_cql.assert_called_once_with("type=page")
+
+    @patch.object(ConfluenceCloud, "_get_paged")
+    def test_get_all_page_versions_follows_paginated_history(self, mock_get_paged, confluence_cloud):
+        mock_get_paged.return_value = iter([{"number": 2}, {"number": 1}])
+
+        assert confluence_cloud.get_all_page_versions("123", expand="storage", limit=50) == [
+            {"number": 2},
+            {"number": 1},
+        ]
+        mock_get_paged.assert_called_once_with(
+            "rest/api/content/123/version",
+            params={"limit": 50, "expand": "storage"},
+        )
+
+    @patch.object(ConfluenceCloud, "delete")
+    def test_remove_content_history_uses_cloud_v1_content_endpoint(self, mock_delete, confluence_cloud):
+        confluence_cloud.remove_content_history("123", 1)
+
+        mock_delete.assert_called_once_with(
+            "https://test.atlassian.net/wiki/rest/api/content/123/version/1", absolute=True
+        )
+
+    @patch.object(ConfluenceCloud, "put")
+    def test_update_template_uses_v1_endpoint_and_object_payload(self, mock_put, confluence_cloud):
+        body = {"storage": {"value": "<p>Template</p>", "representation": "storage"}}
+
+        confluence_cloud.create_or_update_template("Template", body, template_id="template-1")
+
+        mock_put.assert_called_once_with(
+            "https://test.atlassian.net/wiki/rest/api/template",
+            data={"name": "Template", "templateType": "page", "body": body, "templateId": "template-1"},
+            absolute=True,
+        )
+
+    @patch.object(ConfluenceCloud, "get")
+    def test_get_content_template_uses_cloud_v1_endpoint(self, mock_get, confluence_cloud):
+        confluence_cloud.get_content_template("template-1")
+
+        mock_get.assert_called_once_with("https://test.atlassian.net/wiki/rest/api/template/template-1", absolute=True)
+
+    @patch("atlassian.confluence.cloud.requests.get")
+    @patch.object(ConfluenceCloud, "get")
+    def test_export_page_uses_v2_pdf_export_task_endpoint(self, mock_get, mock_requests_get, confluence_cloud):
+        mock_get.side_effect = [
+            b'<meta name="ajs-taskId" content="task-123">',
+            {"state": "SUCCEEDED", "progress": 100, "result": "https://downloads.example.test/page.pdf"},
+        ]
+        mock_requests_get.return_value.content = b"%PDF-1.7"
+
+        result = confluence_cloud.export_page("456")
+
+        assert result == b"%PDF-1.7"
+        assert (
+            mock_get.call_args_list[1].args[0]
+            == "https://test.atlassian.net/wiki/api/v2/pdfexporttask/progress/task-123"
+        )
+        assert mock_get.call_args_list[1].kwargs["absolute"] is True
+        mock_requests_get.assert_called_once_with("https://downloads.example.test/page.pdf", timeout=75)
+
+    @patch("atlassian.confluence.cloud.requests.get")
+    @patch.object(ConfluenceCloud, "get_pdf_download_url_for_confluence_cloud")
+    def test_export_page_rejects_html_response(self, mock_download_url, mock_requests_get, confluence_cloud):
+        mock_download_url.return_value = "https://downloads.example.test/page.pdf"
+        mock_requests_get.return_value.content = b"<!doctype html><html>Sign in</html>"
+
+        with pytest.raises(ApiError, match="non-PDF content"):
+            confluence_cloud.export_page("456")
 
     # Content Management Tests
     @patch.object(ConfluenceCloud, "get")
@@ -81,6 +193,31 @@ class TestConfluenceCloud:
         result = list(confluence_cloud.get_all_pages_from_space("TEST"))
         assert result == [{"id": "1", "title": "Page 1"}, {"id": "2", "title": "Page 2"}]
         assert mock_get.call_count == 2
+
+    @patch.object(ConfluenceCloud, "get")
+    def test_page_exists_uses_v2_space_and_page_endpoints(self, mock_get, confluence_cloud):
+        mock_get.side_effect = [{"results": [{"id": "42", "key": "TEST"}]}, {"results": [{"id": "123"}]}]
+
+        assert confluence_cloud.page_exists("TEST", "Test Page") is True
+        assert mock_get.call_args_list[0].args == ("spaces",)
+        assert mock_get.call_args_list[0].kwargs == {"params": {"keys": ["TEST"], "limit": 1}}
+        assert mock_get.call_args_list[1].args == ("pages",)
+        assert mock_get.call_args_list[1].kwargs == {
+            "params": {
+                "space-id": "42",
+                "title": "Test Page",
+                "status": "current",
+                "body-format": "none",
+                "limit": 1,
+            }
+        }
+
+    @patch.object(ConfluenceCloud, "get")
+    def test_page_exists_returns_false_for_unknown_space(self, mock_get, confluence_cloud):
+        mock_get.return_value = {"results": []}
+
+        assert confluence_cloud.page_exists("MISSING", "Test Page") is False
+        mock_get.assert_called_once_with("spaces", params={"keys": ["MISSING"], "limit": 1})
 
     @patch.object(ConfluenceCloud, "get")
     def test_get_all_blog_posts_from_space(self, mock_get, confluence_cloud):
@@ -176,6 +313,12 @@ class TestConfluenceCloud:
         # covered by existing _get_paged tests.
         assert mock_get.call_args_list[0].args[0] == "spaces"
 
+    @patch.object(ConfluenceCloud, "get_all_spaces")
+    def test_get_space_names(self, mock_get_all_spaces, confluence_cloud):
+        mock_get_all_spaces.return_value = iter([{"name": "Engineering"}, {"name": "Operations"}])
+
+        assert confluence_cloud.get_space_names() == ["Engineering", "Operations"]
+
     @patch.object(ConfluenceCloud, "get")
     def test_get_space(self, mock_get, confluence_cloud):
         """get_space calls the v2 plural endpoint."""
@@ -249,7 +392,9 @@ class TestConfluenceCloud:
         """Test get_groups method."""
         mock_get.return_value = {"results": [{"id": "group1", "name": "Test Group"}]}
         result = confluence_cloud.get_groups()
-        mock_get.assert_called_once_with("group", **{})
+        mock_get.assert_called_once_with(
+            "https://test.atlassian.net/wiki/rest/api/group", params={"start": 0, "limit": 1000}, absolute=True
+        )
         assert result == {"results": [{"id": "group1", "name": "Test Group"}]}
 
     @patch.object(ConfluenceCloud, "get")
@@ -257,7 +402,9 @@ class TestConfluenceCloud:
         """Test get_group method."""
         mock_get.return_value = {"id": "group1", "name": "Test Group"}
         result = confluence_cloud.get_group("group1")
-        mock_get.assert_called_once_with("group/group1", **{})
+        mock_get.assert_called_once_with(
+            "https://test.atlassian.net/wiki/rest/api/group/by-id", params={"id": "group1"}, absolute=True
+        )
         assert result == {"id": "group1", "name": "Test Group"}
 
     @patch.object(ConfluenceCloud, "get")
@@ -265,8 +412,20 @@ class TestConfluenceCloud:
         """Test get_group_members method."""
         mock_get.return_value = {"results": [{"id": "user1", "name": "Test User"}]}
         result = confluence_cloud.get_group_members("group1")
-        mock_get.assert_called_once_with("group/group1/member", **{})
+        mock_get.assert_called_once_with(
+            "https://test.atlassian.net/wiki/rest/api/group/group1/membersByGroupId", params={}, absolute=True
+        )
         assert result == {"results": [{"id": "user1", "name": "Test User"}]}
+
+    @patch.object(ConfluenceCloud, "get_group_members")
+    def test_get_all_members(self, mock_get_group_members, confluence_cloud):
+        mock_get_group_members.side_effect = [
+            {"results": [{"id": "user1"}, {"id": "user2"}]},
+            {"results": []},
+        ]
+
+        assert confluence_cloud.get_all_members("group1") == [{"id": "user1"}, {"id": "user2"}]
+        assert mock_get_group_members.call_args_list[0].args == ("group1",)
 
     # Label Management Tests
     @patch.object(ConfluenceCloud, "get")
