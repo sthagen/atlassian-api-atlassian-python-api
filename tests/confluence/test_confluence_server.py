@@ -111,6 +111,20 @@ class TestConfluenceServer:
         assert pdf_url == "https://test.confluence.com/spaces/flyingpdf/pdfpageexport.action?pageId=123"
         assert word_url == "https://test.confluence.com/exportword?pageId=123"
 
+    def test_server_ui_exports_strip_rest_api_suffix(self):
+        confluence = ConfluenceServer(url="https://test.confluence.com/confluence/rest/api/latest", token="test-token")
+        response = Response()
+        response.status_code = 200
+        response.reason = "OK"
+        response._content = b"%PDF-1.4"
+
+        with patch.object(confluence._session, "request", return_value=response) as mock_request:
+            assert confluence.get_page_as_pdf("123") == b"%PDF-1.4"
+
+        assert mock_request.call_args.kwargs["url"] == (
+            "https://test.confluence.com/confluence/spaces/flyingpdf/pdfpageexport.action?pageId=123"
+        )
+
     def test_bad_request_includes_confluence_validation_details(self, confluence_server):
         response = Response()
         response.status_code = 400
@@ -1374,6 +1388,97 @@ class TestConfluenceServer:
         mock_post.assert_called_once_with("content/123/child/comment", data=comment_data, **{})
         assert result == {"id": "comment2", "text": "New Comment"}
 
+    @patch.object(ConfluenceServer, "get")
+    def test_get_inline_comments_uses_plugin_endpoint(self, mock_get, confluence_server):
+        mock_get.return_value = [{"id": "comment-1"}]
+
+        assert confluence_server.get_inline_comments("123") == [{"id": "comment-1"}]
+        mock_get.assert_called_once_with("rest/inlinecomments/1.0/comments", params={"containerId": "123"})
+
+    @patch.object(ConfluenceServer, "post")
+    def test_add_inline_comment_creates_complete_plugin_payload(self, mock_post, confluence_server):
+        mock_post.return_value = {"id": "comment-1"}
+
+        result = confluence_server.add_inline_comment("123", "selected text", "<p>Note</p>", last_fetch_time=123456789)
+
+        assert result == {"id": "comment-1"}
+        mock_post.assert_called_once_with(
+            "rest/inlinecomments/1.0/comments",
+            data={
+                "containerId": "123",
+                "body": "<p>Note</p>",
+                "originalSelection": "selected text",
+                "matchIndex": 0,
+                "numMatches": 1,
+                "lastFetchTime": 123456789,
+                "serializedHighlights": "",
+            },
+        )
+
+    @patch.object(ConfluenceServer, "post")
+    def test_reply_to_inline_comment_creates_child_comment(self, mock_post, confluence_server):
+        confluence_server.reply_to_inline_comment("123", "comment-1", "<p>Reply</p>")
+
+        assert mock_post.call_args.kwargs["data"] == {
+            "type": "comment",
+            "container": {"id": "123", "type": "page", "status": "current"},
+            "ancestors": [{"id": "comment-1"}],
+            "body": {"storage": {"value": "<p>Reply</p>", "representation": "storage"}},
+        }
+
+    @patch.object(ConfluenceServer, "put")
+    @patch.object(ConfluenceServer, "get")
+    def test_resolve_inline_comment_uses_complete_annotation_payload(self, mock_get, mock_put, confluence_server):
+        mock_get.return_value = [{"id": "comment-1", "body": "<p>Note</p>", "containerId": "123"}]
+        mock_put.return_value = {"id": "comment-1"}
+
+        assert confluence_server.resolve_inline_comment("123", "comment-1") == {"id": "comment-1"}
+        mock_put.assert_called_once_with(
+            "rest/inlinecomments/1.0/comments/comment-1/resolve/true/dangling/false",
+            data={
+                "id": "comment-1",
+                "body": "<p>Note</p>",
+                "containerId": "123",
+                "lastFetchTime": mock_put.call_args.kwargs["data"]["lastFetchTime"],
+                "serializedHighlights": "",
+                "deleted": False,
+                "active": True,
+            },
+        )
+
+    @patch.object(ConfluenceServer, "get")
+    def test_get_likes_uses_ui_endpoint(self, mock_get, confluence_server):
+        mock_get.return_value = {"content_id": "123", "content_type": "page", "likes": []}
+
+        assert confluence_server.get_likes("123")["content_type"] == "page"
+        mock_get.assert_called_once_with("rest/likes/1.0/content/123/likes")
+
+    @patch.object(ConfluenceServer, "post")
+    def test_add_like_uses_configured_username(self, mock_post, confluence_server):
+        mock_post.return_value = {"likes": [{"user": {"name": "test"}}]}
+
+        assert confluence_server.add_like("123") == {"likes": [{"user": {"name": "test"}}]}
+        mock_post.assert_called_once_with("rest/likes/1.0/content/123/likes", data={"username": "test"})
+
+    @patch.object(ConfluenceServer, "get")
+    @patch.object(ConfluenceServer, "post")
+    def test_add_like_is_idempotent_when_server_reports_existing_like(self, mock_post, mock_get, confluence_server):
+        response = Response()
+        response.status_code = 400
+        response._content = b"The content cannot be liked"
+        mock_post.side_effect = HTTPError(response=response)
+        mock_get.return_value = {"likes": [{"user": {"name": "test"}}]}
+
+        assert confluence_server.add_like("123") == {"likes": [{"user": {"name": "test"}}]}
+        mock_get.assert_called_once_with("rest/likes/1.0/content/123/likes")
+
+    @patch.object(ConfluenceServer, "delete")
+    def test_remove_like_uses_ui_endpoint(self, mock_delete, confluence_server):
+        mock_delete.return_value = {"likes": []}
+
+        assert confluence_server.remove_like("123") == {"likes": []}
+        mock_delete.assert_called_once_with("rest/likes/1.0/content/123/likes")
+
     @patch.object(ConfluenceServer, "put")
     def test_update_comment(self, mock_put, confluence_server):
         """Test update_comment method."""
@@ -1647,8 +1752,9 @@ class TestConfluenceServer:
             confluence_server.get_page_as_pdf("123")
 
         mock_get.assert_called_once_with(
-            "spaces/flyingpdf/pdfpageexport.action?pageId=123",
+            "https://test.confluence.com/spaces/flyingpdf/pdfpageexport.action?pageId=123",
             headers=confluence_server.form_token_headers,
+            absolute=True,
             advanced_mode=True,
         )
 
@@ -1662,7 +1768,10 @@ class TestConfluenceServer:
 
         assert result == export
         mock_get.assert_called_once_with(
-            "exportword?pageId=123", headers=confluence_server.form_token_headers, not_json_response=True
+            "https://test.confluence.com/exportword?pageId=123",
+            headers=confluence_server.form_token_headers,
+            not_json_response=True,
+            absolute=True,
         )
 
     @patch.object(ConfluenceServer, "post")

@@ -445,6 +445,21 @@ Page actions
         author = comment.get('history', {}).get('createdBy')
         latest_editor = comment.get('version', {}).get('by')
 
+    # Server/Data Center only: inline annotations use an undocumented
+    # Confluence UI endpoint. The selection must match page text exactly.
+    inline_comments = confluence.get_inline_comments(page_id)
+    annotation = confluence.add_inline_comment(
+        page_id, 'selected text', '<p>Please clarify this sentence.</p>'
+    )
+    confluence.reply_to_inline_comment(page_id, annotation['id'], '<p>Done.</p>')
+    confluence.resolve_inline_comment(page_id, annotation['id'])
+
+    # Server/Data Center only: likes are also exposed through an undocumented
+    # Confluence UI endpoint. The content ID may be a page, blog post, or comment.
+    likes = confluence.get_likes(page_id)
+    confluence.add_like(page_id)
+    confluence.remove_like(page_id)
+
     # Cloud V2 has separate methods for footer and inline comments. Their
     # result items include authorId; request body_format for comment bodies.
     footer_comments = cloud.get_page_footer_comments(page_id, body_format='view')

@@ -103,6 +103,15 @@ class Server(ConfluenceServerBase):
         api_parts.append(normalized_path)
         return "/".join(str(part).strip("/") for part in api_parts if part is not None and str(part).strip("/"))
 
+    def _ui_url(self, path):
+        """Return an absolute URL for a Confluence UI action.
+
+        The PDF and Word exporters are UI actions, not REST resources.  Some
+        existing integrations initialise the client with a REST API URL, so
+        remove that suffix before resolving UI paths.
+        """
+        return self.url_joiner(self.url.split("/rest/api/", 1)[0], path)
+
     def request(
         self,
         method="GET",
@@ -209,6 +218,110 @@ class Server(ConfluenceServerBase):
     def get_blog_post_by_title(self, space_key, title, **kwargs):
         """Get blog post by title and space key."""
         return self.get("content", params={"spaceKey": space_key, "title": title, "type": "blogpost", **kwargs})
+
+    def get_plugins_info(self):
+        """
+        Provide plugins info
+        :return a json of installed plugins
+        """
+        url = "rest/plugins/1.0/"
+        return self.get(url, headers=self.no_check_headers, trailing=True)
+
+    def get_plugin_info(self, plugin_key: str):
+        """
+        Provide plugin info
+        :return a json of installed plugins
+        """
+        url = f"rest/plugins/1.0/{plugin_key}-key"
+        return self.get(url, headers=self.no_check_headers, trailing=True)
+
+    def get_plugin_license_info(self, plugin_key: str):
+        """
+        Provide plugin license info
+        :return a json specific License query
+        """
+        url = f"rest/plugins/1.0/{plugin_key}-key/license"
+        return self.get(url, headers=self.no_check_headers, trailing=True)
+
+    def upload_plugin(self, plugin_path: str):
+        """
+        Provide plugin path for upload into Confluence e.g. useful for auto deploy
+        :param plugin_path:
+        :return:
+        """
+        files = {"plugin": open(plugin_path, "rb")}
+        upm_token = self.request(
+            method="GET",
+            path="rest/plugins/1.0/",
+            headers=self.no_check_headers,
+            trailing=True,
+        ).headers["upm-token"]
+        url = f"rest/plugins/1.0/?token={upm_token}"
+        return self.post(url, files=files, headers=self.no_check_headers)
+
+    def delete_plugin(self, plugin_key: str):
+        """
+        Delete plugin
+        :param plugin_key:
+        :return:
+        """
+        url = f"rest/plugins/1.0/{plugin_key}-key"
+        return self.delete(url)
+
+    def check_plugin_manager_status(self):
+        """Perform the Confluence check plugin manager status operation.
+
+        Args:
+            See the method signature for API request parameters.
+
+        Returns:
+            Decoded Confluence REST response.
+        """
+        url = "rest/plugins/latest/safe-mode"
+        return self.request(method="GET", path=url, headers=self.safe_mode_headers)
+
+    def update_plugin_license(self, plugin_key: str, raw_license: str):
+        """
+        Update license for plugin
+        :param plugin_key:
+        :param raw_license:
+        :return:
+        """
+        app_headers = {
+            "X-Atlassian-Token": "no-check",
+            "Content-Type": "application/vnd.atl.plugins+json",
+        }
+        url = f"/plugins/1.0/{plugin_key}/license"
+        data = {"rawLicense": raw_license}
+        return self.put(url, data=data, headers=app_headers)
+
+    def disable_plugin(self, plugin_key: str):
+        """
+        Disable a plugin
+        :param plugin_key:
+        :return:
+        """
+        app_headers = {
+            "X-Atlassian-Token": "no-check",
+            "Content-Type": "application/vnd.atl.plugins+json",
+        }
+        url = f"rest/plugins/1.0/{plugin_key}-key"
+        data = {"status": "disabled"}
+        return self.put(url, data=data, headers=app_headers)
+
+    def enable_plugin(self, plugin_key: str):
+        """
+        Enable a plugin
+        :param plugin_key:
+        :return:
+        """
+        app_headers = {
+            "X-Atlassian-Token": "no-check",
+            "Content-Type": "application/vnd.atl.plugins+json",
+        }
+        url = f"rest/plugins/1.0/{plugin_key}-key"
+        data = {"status": "enabled"}
+        return self.put(url, data=data, headers=app_headers)
 
     def page_exists(self, space_key, title, **kwargs):
         """Check if page exists."""
@@ -1104,6 +1217,154 @@ class Server(ConfluenceServerBase):
 
         return response
 
+    # Inline comment management
+    # These endpoints are used by the Confluence Server/Data Center web UI,
+    # but are not part of Atlassian's documented REST API.
+    _inline_comments_resource = "rest/inlinecomments/1.0/comments"
+
+    def get_inline_comments(self, page_id):
+        """Return the inline annotations anchored in a page's body.
+
+        This uses Confluence Server/Data Center's undocumented inline-comment
+        plugin endpoint.  Its response shape is intentionally returned
+        unchanged because it varies between Confluence releases.
+
+        :param page_id: ID of the page containing the annotations.
+        """
+        return self.get(self._inline_comments_resource, params={"containerId": page_id})
+
+    def add_inline_comment(
+        self,
+        page_id,
+        selection,
+        body,
+        match_index=0,
+        num_matches=1,
+        serialized_highlights="",
+        last_fetch_time=None,
+    ):
+        """Create an inline annotation anchored to selected page text.
+
+        ``selection`` must exactly match text in the current page body.
+        ``match_index`` selects which matching occurrence should be annotated.
+        Confluence creates the marker in storage automatically; callers must
+        not update the page body or version themselves.
+
+        This is an undocumented Server/Data Center UI endpoint.
+        """
+        if not selection or not isinstance(selection, str):
+            raise ApiValueError("selection must be a non-empty string")
+        if not body or not isinstance(body, str):
+            raise ApiValueError("body must be a non-empty storage-format string")
+        if not isinstance(match_index, int) or match_index < 0:
+            raise ApiValueError("match_index must be a non-negative integer")
+        if not isinstance(num_matches, int) or num_matches < 1:
+            raise ApiValueError("num_matches must be a positive integer")
+
+        data = {
+            "containerId": page_id,
+            "body": body,
+            "originalSelection": selection,
+            "matchIndex": match_index,
+            "numMatches": num_matches,
+            "lastFetchTime": int(time.time() * 1000) if last_fetch_time is None else last_fetch_time,
+            "serializedHighlights": serialized_highlights,
+        }
+        return self.post(self._inline_comments_resource, data=data)
+
+    def reply_to_inline_comment(self, page_id, comment_id, body):
+        """Reply to an inline annotation using the regular content API.
+
+        This is supported by Confluence's comment hierarchy even though the
+        annotation itself originates from the inline-comments plugin endpoint.
+        """
+        if not body or not isinstance(body, str):
+            raise ApiValueError("body must be a non-empty storage-format string")
+
+        data = {
+            "type": "comment",
+            "container": {"id": page_id, "type": "page", "status": "current"},
+            "ancestors": [{"id": comment_id}],
+            "body": self._create_body(body, "storage"),
+        }
+        return self.post("rest/api/content", data=data)
+
+    def resolve_inline_comment(self, page_id, comment_id, resolved=True, dangling=False):
+        """Resolve or reopen an inline annotation.
+
+        The plugin requires the complete annotation object in the PUT payload,
+        so the method first retrieves annotations for ``page_id``.  ``dangling``
+        should be true only when the annotation no longer has a valid anchor.
+
+        This is an undocumented Server/Data Center UI endpoint.
+        """
+        comments = self.get_inline_comments(page_id)
+        if isinstance(comments, dict):
+            comments = comments.get("results", comments.get("comments", []))
+        if not isinstance(comments, list):
+            raise ApiError("Confluence returned an unexpected inline comments response")
+
+        comment = next((item for item in comments if str(item.get("id")) == str(comment_id)), None)
+        if comment is None:
+            raise ApiNotFoundError(f"Inline comment '{comment_id}' was not found on page '{page_id}'")
+
+        data = dict(comment)
+        data.update(
+            {
+                "containerId": data.get("containerId", page_id),
+                "lastFetchTime": data.get("lastFetchTime", int(time.time() * 1000)),
+                "serializedHighlights": data.get("serializedHighlights", ""),
+                "deleted": data.get("deleted", False),
+                "active": data.get("active", True),
+            }
+        )
+        resolve_path = (
+            f"{self._inline_comments_resource}/{comment_id}/resolve/"
+            f"{str(bool(resolved)).lower()}/dangling/{str(bool(dangling)).lower()}"
+        )
+        return self.put(resolve_path, data=data)
+
+    # Like management
+    # These endpoints are used by the Confluence Server/Data Center web UI,
+    # but are not part of Atlassian's documented REST API.
+    _likes_resource = "rest/likes/1.0/content"
+
+    def get_likes(self, content_id):
+        """Return likes for a page, blog post, or comment.
+
+        The raw UI endpoint response includes both ``content_type`` and
+        ``content_id``.  This is an undocumented Server/Data Center endpoint.
+        """
+        return self.get(f"{self._likes_resource}/{content_id}/likes")
+
+    def add_like(self, content_id, username=None):
+        """Like content as ``username`` or the configured authenticated user.
+
+        The operation is idempotent: when Confluence reports that the user has
+        already liked the content, the current like list is returned instead of
+        surfacing its otherwise ambiguous HTTP 400 response.
+        """
+        username = username or self.username
+        if not username:
+            raise ApiValueError("username is required when the client has no configured username")
+
+        try:
+            return self.post(f"{self._likes_resource}/{content_id}/likes", data={"username": username})
+        except HTTPError as error:
+            response = error.response
+            message = response.text.lower() if response is not None else ""
+            if response is not None and response.status_code == 400 and "cannot be liked" in message:
+                return self.get_likes(content_id)
+            raise
+
+    def remove_like(self, content_id):
+        """Remove the authenticated user's like from content.
+
+        This is an undocumented Server/Data Center UI endpoint.  Confluence
+        determines the like to remove from the authenticated user.
+        """
+        return self.delete(f"{self._likes_resource}/{content_id}/likes")
+
     def attach_content(
         self,
         content,
@@ -1175,15 +1436,26 @@ class Server(ConfluenceServerBase):
                     pass
 
                 if existing_attachment:
-                    # Update existing attachment using PUT on the specific attachment ID
+                    # Update existing attachment on the specific attachment ID
                     attachment_id = existing_attachment["id"]
-                    update_path = f"rest/api/content/{attachment_id}"
-                    response = self.put(
-                        path=update_path,
-                        data=data,
-                        headers=headers,
-                        files={"file": (name, content, content_type)},
-                    )
+                    if self.api_version == "1.0":
+                        # older API versions use POST on data path below the child
+                        update_path = f"{path}/{attachment_id}/data"
+                        response = self.post(
+                            path=update_path,
+                            data=data,
+                            headers=headers,
+                            files={"file": (name, content, content_type)},
+                        )
+                    else:
+                        # newer API versions use PUT on a path derived from the attachment ID directly
+                        update_path = f"rest/api/content/{attachment_id}"
+                        response = self.put(
+                            path=update_path,
+                            data=data,
+                            headers=headers,
+                            files={"file": (name, content, content_type)},
+                        )
                 else:
                     # Create new attachment using POST
                     response = self.post(
@@ -3414,13 +3686,14 @@ class Server(ConfluenceServerBase):
         :return: PDF File
         """
         headers = self.form_token_headers
-        url = f"spaces/flyingpdf/pdfpageexport.action?pageId={page_id}"
-        response = self.get(url, headers=headers, advanced_mode=True)
+        url = self._ui_url(f"spaces/flyingpdf/pdfpageexport.action?pageId={page_id}")
+        response = self.get(url, headers=headers, absolute=True, advanced_mode=True)
         content = response.content
         if not content.startswith(b"%PDF-"):
             raise ApiError(
-                "Confluence returned non-PDF content while exporting the page. "
-                "Check the page permissions and authentication configuration."
+                "Confluence returned non-PDF content while exporting the page from "
+                f"{getattr(response, 'url', url)}. Check the page permissions, "
+                "authentication configuration, and Confluence context path."
             )
         return content
 
@@ -3459,8 +3732,8 @@ class Server(ConfluenceServerBase):
         :return: Legacy Word-export bytes
         """
         headers = self.form_token_headers
-        url = f"exportword?pageId={page_id}"
-        return self.get(url, headers=headers, not_json_response=True)
+        url = self._ui_url(f"exportword?pageId={page_id}")
+        return self.get(url, headers=headers, not_json_response=True, absolute=True)
 
     def get_space_export(self, space_key: str, export_type: str) -> str:
         """
@@ -3717,102 +3990,6 @@ class Server(ConfluenceServerBase):
             raise
 
         return response
-
-    def get_plugins_info(self):
-        """
-        Provide plugins info
-        :return a json of installed plugins
-        """
-        url = "rest/plugins/1.0/"
-        return self.get(url, headers=self.no_check_headers, trailing=True)
-
-    def get_plugin_info(self, plugin_key):
-        """
-        Provide plugin info
-        :return a json of installed plugins
-        """
-        url = f"rest/plugins/1.0/{plugin_key}-key"
-        return self.get(url, headers=self.no_check_headers, trailing=True)
-
-    def get_plugin_license_info(self, plugin_key):
-        """
-        Provide plugin license info
-        :return a json specific License query
-        """
-        url = f"rest/plugins/1.0/{plugin_key}-key/license"
-        return self.get(url, headers=self.no_check_headers, trailing=True)
-
-    def upload_plugin(self, plugin_path):
-        """
-        Provide plugin path for upload into Jira e.g. useful for auto deploy
-        :param plugin_path:
-        :return:
-        """
-        files = {"plugin": open(plugin_path, "rb")}
-        upm_token = self.request(
-            method="GET",
-            path="rest/plugins/1.0/",
-            headers=self.no_check_headers,
-            trailing=True,
-        ).headers["upm-token"]
-        url = f"rest/plugins/1.0/?token={upm_token}"
-        return self.post(url, files=files, headers=self.no_check_headers)
-
-    def disable_plugin(self, plugin_key):
-        """
-        Disable a plugin
-        :param plugin_key:
-        :return:
-        """
-        app_headers = {
-            "X-Atlassian-Token": "no-check",
-            "Content-Type": "application/vnd.atl.plugins+json",
-        }
-        url = f"rest/plugins/1.0/{plugin_key}-key"
-        data = {"status": "disabled"}
-        return self.put(url, data=data, headers=app_headers)
-
-    def enable_plugin(self, plugin_key):
-        """
-        Enable a plugin
-        :param plugin_key:
-        :return:
-        """
-        app_headers = {
-            "X-Atlassian-Token": "no-check",
-            "Content-Type": "application/vnd.atl.plugins+json",
-        }
-        url = f"rest/plugins/1.0/{plugin_key}-key"
-        data = {"status": "enabled"}
-        return self.put(url, data=data, headers=app_headers)
-
-    def delete_plugin(self, plugin_key):
-        """
-        Delete plugin
-        :param plugin_key:
-        :return:
-        """
-        url = f"rest/plugins/1.0/{plugin_key}-key"
-        return self.delete(url)
-
-    def check_plugin_manager_status(self):
-        url = "rest/plugins/latest/safe-mode"
-        return self.request(method="GET", path=url, headers=self.safe_mode_headers)
-
-    def update_plugin_license(self, plugin_key, raw_license):
-        """
-        Update license for plugin
-        :param plugin_key:
-        :param raw_license:
-        :return:
-        """
-        app_headers = {
-            "X-Atlassian-Token": "no-check",
-            "Content-Type": "application/vnd.atl.plugins+json",
-        }
-        url = f"/plugins/1.0/{plugin_key}/license"
-        data = {"rawLicense": raw_license}
-        return self.put(url, data=data, headers=app_headers)
 
     def check_long_tasks_result(self, start=None, limit=None, expand=None):
         """

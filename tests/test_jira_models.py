@@ -748,3 +748,32 @@ def test_bulk_serialize_with_mapping():
     issue = task().project(key="P").summary("S").epic_link("E-99").build()
     out = bulk_serialize([issue], mapping=mapping)
     assert out[0]["fields"]["customfield_777"] == "E-99"
+
+
+# Tests for jira_models module convenience imports
+def test_jira_models_task_import():
+    """Test that task can be imported from jira_models."""
+    from atlassian.jira_models import task as jm_task
+
+    assert jm_task is task
+
+
+def test_jira_models_serialize_import():
+    """Test that serialize can be imported from jira_models."""
+    from atlassian.jira_models import serialize as jm_serialize
+
+    assert jm_serialize is serialize
+
+
+def test_jira_models_comment_import():
+    """Test that Comment can be imported from jira_models."""
+    from atlassian.jira_models import Comment as jm_Comment
+
+    assert jm_Comment is Comment
+
+
+def test_jira_models_project_import():
+    """Test that Project can be imported from jira_models."""
+    from atlassian.jira_models import Project as jm_Project
+
+    assert jm_Project is Project
