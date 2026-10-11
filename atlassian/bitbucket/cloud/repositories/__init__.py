@@ -16,6 +16,7 @@ from .pipelines import Pipelines
 from .pullRequests import PullRequests
 from .refs import Branches, Tags
 from .repositoryVariables import RepositoryVariables
+from .userPermissions import UserPermissions
 from ..base import BitbucketCloudBase
 
 
@@ -204,8 +205,10 @@ class WorkspaceRepositories(RepositoriesBase):
             self.get(repository, by)
             exists = True
         except HTTPError as e:
-            if e.response.status_code in (401, 404):
+            if e.response.status_code == 404:
                 pass
+            else:
+                raise
         except Exception as e:
             if not str(e) == f"Unknown repository {by} '{repository}'":
                 raise e
@@ -281,6 +284,7 @@ class Repository(BitbucketCloudBase):
             f"{self.url}/pipelines_config/variables", **self._new_session_args
         )
         self.__tags = Tags(f"{self.url}/refs/tags", **self._new_session_args)
+        self.__user_permissions = UserPermissions(f"{self.url}/permissions-config/users", **self._new_session_args)
         self.__downloads = Downloads(f"{self.url}/downloads", **self._new_session_args)
 
     def update(self, **kwargs):
@@ -469,6 +473,11 @@ class Repository(BitbucketCloudBase):
     def tags(self):
         """The repository tags."""
         return self.__tags
+
+    @property
+    def user_permissions(self):
+        """The repository user permissions"""
+        return self.__user_permissions
 
     @property
     def downloads(self):

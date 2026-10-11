@@ -190,6 +190,23 @@ class TestConfluenceServer:
 
         assert mock_post.call_args.kwargs["files"] == {"file": ("diagram.png", content, "image/png")}
 
+    @pytest.mark.parametrize("api_version", [None, "latest", "1.0"], ids=["default", "latest", "1.0"])
+    @patch.object(ConfluenceServer, "put")
+    @patch.object(ConfluenceServer, "get")
+    @patch.object(ConfluenceServer, "post")
+    def test_attach_content_updates_existing_attachment_with_post(self, mock_post, mock_get, mock_put, api_version):
+        kwargs = {} if api_version is None else {"api_version": api_version}
+        confluence = ConfluenceServer(url="https://test.confluence.com", username="test", password="test", **kwargs)
+        content = io.BytesIO(b"new image")
+        mock_get.return_value = {"results": [{"id": "att-1", "title": "diagram.png"}]}
+        mock_post.return_value = {"id": "att-1"}
+
+        confluence.attach_content(content, "diagram.png", "image/png", page_id="123")
+
+        mock_put.assert_not_called()
+        assert mock_post.call_args.kwargs["path"] == "rest/api/content/123/child/attachment/att-1/data"
+        assert mock_post.call_args.kwargs["files"] == {"file": ("diagram.png", content, "image/png")}
+
     def test_attach_content_rejects_empty_attachment_name(self, confluence_server):
         with pytest.raises(ApiValueError, match="must contain a filename"):
             confluence_server.attach_content(io.BytesIO(b"content"), "/", page_id="123")
@@ -829,6 +846,34 @@ class TestConfluenceServer:
         assert result == [{"id": "1", "title": "Child 1"}, {"id": "2", "title": "Child 2"}]
         second_call = mock_get.call_args_list[1]
         assert second_call.args[0] == "https://test.confluence.com/rest/api/content/123/child/page?limit=25&start=25"
+        assert second_call.kwargs["absolute"] is True
+
+    @pytest.mark.parametrize(
+        "base_url", ["https://test.confluence.com/confluence", "https://test.confluence.com/confluence/"]
+    )
+    @pytest.mark.parametrize(
+        "next_link",
+        [
+            "/rest/api/content/123/child/page?limit=25&start=25",
+            "rest/api/content/123/child/page?limit=25&start=25",
+            "/confluence/rest/api/content/123/child/page?limit=25&start=25",
+        ],
+    )
+    def test_child_page_pagination_keeps_context_path(self, base_url, next_link):
+        confluence = ConfluenceServer(url=base_url, username="test", password="test", cloud=False)
+        responses = [
+            {"results": [{"id": "1", "title": "Child 1"}], "_links": {"next": next_link}},
+            {"results": [{"id": "2", "title": "Child 2"}]},
+        ]
+        with patch.object(ConfluenceServer, "get", side_effect=responses) as mock_get:
+            result = list(confluence.get_page_child_by_type("123"))
+
+        assert result == [{"id": "1", "title": "Child 1"}, {"id": "2", "title": "Child 2"}]
+        second_call = mock_get.call_args_list[1]
+        assert (
+            second_call.args[0]
+            == "https://test.confluence.com/confluence/rest/api/content/123/child/page?limit=25&start=25"
+        )
         assert second_call.kwargs["absolute"] is True
 
     @patch.object(ConfluenceServer, "get")

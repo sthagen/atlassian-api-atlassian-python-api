@@ -195,7 +195,14 @@ class ConfluenceBase(AtlassianRestAPI):
             # query.  Reusing the already-resolved endpoint preserves both
             # ``/wiki`` and API-gateway tenant prefixes.
             parsed_next = urlparse(url)
-            if getattr(self, "api_version", None) == 2 and parsed_next.query and not parsed_next.scheme:
+            next_path = parsed_next.path.strip("/")
+            current_path = urlparse(current_url).path.strip("/")
+            if (
+                str(getattr(self, "api_version", "")) == "2"
+                and parsed_next.query
+                and not parsed_next.scheme
+                and (not next_path or next_path == current_path)
+            ):
                 url = current_url
                 params = dict(parse_qsl(parsed_next.query, keep_blank_values=True))
                 trailing = False
@@ -208,7 +215,13 @@ class ConfluenceBase(AtlassianRestAPI):
                 parsed = urlparse(self.url)
                 site_url = f"{parsed.scheme}://{parsed.netloc}"
                 if url.startswith("/") or url.startswith(("rest/", "wiki/")):
-                    url = f"{site_url}/{url.lstrip('/')}"
+                    # On Server, next links are relative to the context path
+                    # (e.g. ``/confluence``) unless they already include it.
+                    path = f"/{url.lstrip('/')}"
+                    context = "" if self.cloud else parsed.path.rstrip("/")
+                    if context and path != context and not path.startswith(f"{context}/"):
+                        path = f"{context}{path}"
+                    url = f"{site_url}{path}"
                 else:
                     url = urljoin(f"{self.url.rstrip('/')}/", url)
 

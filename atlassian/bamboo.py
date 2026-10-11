@@ -47,9 +47,8 @@ class Bamboo(AtlassianRestAPI):
                 response.raise_for_status()
                 response = response.json()
             except HTTPError as e:
-                logging.error(f"Broken response: {e}")
-                yield e
-                return
+                log.error(f"Broken response: {e}")
+                raise
         try:
             results = response[elements_key]
             size = 0
@@ -62,8 +61,8 @@ class Bamboo(AtlassianRestAPI):
                 size += 1
                 yield r
         except TypeError:
-            logging.error(f"Broken response: {response}")
-            yield response
+            log.error(f"Broken response: {response}")
+            raise
 
     def base_list_call(
         self,
@@ -759,9 +758,9 @@ class Bamboo(AtlassianRestAPI):
         :param build_key: Take full build key, example: PROJECT-PLAN-8
         """
         custom_resource = "/build/admin/deletePlanResults.action"
-        build_key = build_key.split("-")
-        plan_key = f"{build_key[0]}-{build_key[1]}"
-        build_number = build_key[2]
+        build_key_parts = build_key.split("-")
+        plan_key = "-".join(build_key_parts[:-1])
+        build_number = build_key_parts[-1]
         params = {"buildKey": plan_key, "buildNumber": build_number}
         return self.post(custom_resource, params=params, headers=self.form_token_headers)
 
@@ -906,7 +905,6 @@ class Bamboo(AtlassianRestAPI):
         resource = f"result/{project_key}-{plan_key}-{build_number}/label/{label}"
         return self.delete(self.resource_url(resource))
 
-    @property
     def get_projects(self, start=0, limit=25):
         """Method used to list all projects defined in Bamboo.
         Projects without any plan are not listed.
@@ -2430,7 +2428,6 @@ class Bamboo(AtlassianRestAPI):
         :param plugin_path:
         :return:
         """
-        files = {"plugin": open(plugin_path, "rb")}
         upm_token = self.request(
             method="GET",
             path="rest/plugins/1.0/",
@@ -2438,7 +2435,9 @@ class Bamboo(AtlassianRestAPI):
             trailing=True,
         ).headers["upm-token"]
         url = f"rest/plugins/1.0/?token={upm_token}"
-        return self.post(url, files=files, headers=self.no_check_headers)
+        with open(plugin_path, "rb") as plugin_file:
+            files = {"plugin": plugin_file}
+            return self.post(url, files=files, headers=self.no_check_headers)
 
     def disable_plugin(self, plugin_key):
         """
@@ -2499,7 +2498,6 @@ class Bamboo(AtlassianRestAPI):
         url = f"/plugins/1.0/{plugin_key}/license"
         data = {"rawLicense": raw_license}
         return self.put(url, data=data, headers=app_headers)
-
 
     """Admin (root API)"""
 
@@ -2598,8 +2596,6 @@ class Bamboo(AtlassianRestAPI):
             params["externalRename"] = external_rename
         return self.put(self._admin_url(f"user/{new_user_name}"), params=params, data=data)
 
-
-
     """Admin (users)"""
 
     def remove_plan_custom_expiry_settings(self, plan_key):
@@ -2676,8 +2672,6 @@ class Bamboo(AtlassianRestAPI):
         """
         return self.post(self.resource_url(f"admin/users/{name}/groups"), data=data)
 
-
-
     """Agents & assignments"""
 
     def delete_agent(self, agent_id):
@@ -2714,7 +2708,16 @@ class Bamboo(AtlassianRestAPI):
         """
         return self.delete(self.resource_url(f"config/job/{job_key}/agent-assignment/{executor_key}"))
 
-    def search_entity_for_agent(self, max_result=None, executor_type=None, search_term=None, executor_id=None, entity_type=None, start_index=None, assignment_type=None):
+    def search_entity_for_agent(
+        self,
+        max_result=None,
+        executor_type=None,
+        search_term=None,
+        executor_id=None,
+        entity_type=None,
+        start_index=None,
+        assignment_type=None,
+    ):
         """Search for assignments in specified entity's agents
         :param max_result: max-result query parameter
         :param executor_type: executorType query parameter
@@ -2789,7 +2792,7 @@ class Bamboo(AtlassianRestAPI):
         return self.post(self.resource_url("agent/assignment"), params=params)
 
     def add_agent_assignment_for_job(self, job_key, data):
-        """Add agent assignment for job. agentAssignmentKey is a map with one key-value: name - agentAssignmentKey. 
+        """Add agent assignment for job. agentAssignmentKey is a map with one key-value: name - agentAssignmentKey.
         :param job_key: jobKey path parameter
         :param data: request body (dict or list)
         :return:
@@ -2804,8 +2807,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.put(self.resource_url(f"agent/{agent_id}/capability/{capability_key}"), data=data)
-
-
 
     """Avatars"""
 
@@ -2832,8 +2833,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.put(self.resource_url("avatar/user/avatar.png"), data=data)
-
-
 
     """Deployments"""
 
@@ -3029,7 +3028,9 @@ class Bamboo(AtlassianRestAPI):
             params["planKey"] = plan_key
         return self.get(self.resource_url("deploy/preview/possibleResults"), params=params)
 
-    def get_version_preview_1(self, previous_version_id=None, deployment_project_id=None, plan_key=None, result_key=None, build_number=None):
+    def get_version_preview_1(
+        self, previous_version_id=None, deployment_project_id=None, plan_key=None, result_key=None, build_number=None
+    ):
         """Get a preview of the deployment version.
         :param previous_version_id: previousVersionId query parameter
         :param deployment_project_id: deploymentProjectId query parameter
@@ -3051,7 +3052,9 @@ class Bamboo(AtlassianRestAPI):
             params["buildNumber"] = build_number
         return self.get(self.resource_url("deploy/preview/result"), params=params)
 
-    def get_version_preview(self, previous_version_id=None, version_id=None, deployment_project_id=None, version_name=None):
+    def get_version_preview(
+        self, previous_version_id=None, version_id=None, deployment_project_id=None, version_name=None
+    ):
         """Get a preview of the deployment version.
         :param previous_version_id: previousVersionId query parameter
         :param version_id: versionId query parameter
@@ -3135,7 +3138,9 @@ class Bamboo(AtlassianRestAPI):
             params["branchKey"] = branch_key
         return self.get(self.resource_url(f"deploy/project/{deployment_project_id}/version"), params=params)
 
-    def get_deployment_naming_preview(self, deployment_project_id, next_version_name, incrementable_variables=None, increment_numbers=None):
+    def get_deployment_naming_preview(
+        self, deployment_project_id, next_version_name, incrementable_variables=None, increment_numbers=None
+    ):
         """Get deployment version name preview.
         :param deployment_project_id: deploymentProjectId path parameter
         :param next_version_name: nextVersionName query parameter
@@ -3216,7 +3221,7 @@ class Bamboo(AtlassianRestAPI):
         return self.get(self.resource_url(f"deploy/version/{deployment_version_id}/status"))
 
     def add_agent_assignment_for_environment(self, environment_id, data):
-        """Add agent assignment for environment. agentAssignmentKey is a map with one key-value: name - agentAssignmentKey. 
+        """Add agent assignment for environment. agentAssignmentKey is a map with one key-value: name - agentAssignmentKey.
         :param environment_id: environmentId path parameter
         :param data: request body (dict or list)
         :return:
@@ -3308,8 +3313,6 @@ class Bamboo(AtlassianRestAPI):
             self.resource_url(f"deploy/environment/{environment_id}/variable/{variable_name}"),
             data=data,
         )
-
-
 
     """Ephemeral agents"""
 
@@ -3434,8 +3437,6 @@ class Bamboo(AtlassianRestAPI):
             self.resource_url(f"ephemeral/templateConfiguration/{configuration_id}/capability"),
             data=data,
         )
-
-
 
     """Global permissions"""
 
@@ -3584,8 +3585,6 @@ class Bamboo(AtlassianRestAPI):
             params["ignore"] = ignore
         return self.put(self.resource_url(f"permissions/global/users/{name}"), params=params, data=data)
 
-
-
     """Plans"""
 
     def unmark_plan_favourite(self, project_key, build_key):
@@ -3679,8 +3678,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.post(self.resource_url(f"plan/{project_key}-{build_key}/test/{test_id}/unleash"))
-
-
 
     """Projects & repositories"""
 
@@ -3802,8 +3799,6 @@ class Bamboo(AtlassianRestAPI):
             self.resource_url(f"project/{project_key}/repository/{repository_id}/enableAllRepositoriesAccess"),
             data=data,
         )
-
-
 
     """Repositories"""
 
@@ -3954,8 +3949,6 @@ class Bamboo(AtlassianRestAPI):
         """
         return self.put(self.resource_url("repository/testConnection"), data=data)
 
-
-
     """Build results"""
 
     def remove_build_comment(self, project_key, build_key, build_number, comment_id):
@@ -3970,7 +3963,22 @@ class Bamboo(AtlassianRestAPI):
             self.resource_url(f"result/{project_key}-{build_key}-{build_number}/comment/{comment_id}"),
         )
 
-    def get_branch_history(self, project_key, build_key, branch_name, include_all_states=None, continuable=None, issue_key=None, max_results=None, start_index=None, label=None, buildstate=None, favourite=None, expand=None, life_cycle_state=None):
+    def get_branch_history(
+        self,
+        project_key,
+        build_key,
+        branch_name,
+        include_all_states=None,
+        continuable=None,
+        issue_key=None,
+        max_results=None,
+        start_index=None,
+        label=None,
+        buildstate=None,
+        favourite=None,
+        expand=None,
+        life_cycle_state=None,
+    ):
         """Provide list of build results for specified plan's branch. Plan might be top level plan (projectKey-planKey) or job plan (projectKey-planKey-jobKey).
         :param project_key: projectKey path parameter
         :param build_key: buildKey path parameter
@@ -4013,8 +4021,6 @@ class Bamboo(AtlassianRestAPI):
             params=params,
         )
 
-
-
     """Web sudo"""
 
     def remove_web_sudo_from_session(self):
@@ -4035,8 +4041,6 @@ class Bamboo(AtlassianRestAPI):
         """
         return self.put(self.resource_url("websudo-session"))
 
-
-
     """General"""
 
     def get_all_services(self):
@@ -4044,8 +4048,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.get(self.resource_url(""))
-
-
 
     """Build numbers & clone"""
 
@@ -4076,8 +4078,6 @@ class Bamboo(AtlassianRestAPI):
         """
         return self.put(self.resource_url(f"clone/{project_key}-{build_key}:{to_project_key}-{to_build_key}"))
 
-
-
     """Server capabilities"""
 
     def get_all_capabilities_on_server(self, max_result=None, search_term=None, last_group=None, start_index=None):
@@ -4099,8 +4099,6 @@ class Bamboo(AtlassianRestAPI):
             params["start-index"] = start_index
         return self.get(self.resource_url("capability/groupedListing"), params=params)
 
-
-
     """Plan summary charts"""
 
     def get_plan_summary(self, build_keys=None):
@@ -4113,11 +4111,11 @@ class Bamboo(AtlassianRestAPI):
             params["buildKeys"] = build_keys
         return self.get(self.resource_url("chart/planSummary"), params=params)
 
-
-
     """Plan dependencies"""
 
-    def search_for_available_plan_child_dependencies(self, project_key, build_key, search_term, max_result=None, start_index=None):
+    def search_for_available_plan_child_dependencies(
+        self, project_key, build_key, search_term, max_result=None, start_index=None
+    ):
         """Search for available plan child dependencies
         :param project_key: projectKey path parameter
         :param build_key: buildKey path parameter
@@ -4138,7 +4136,9 @@ class Bamboo(AtlassianRestAPI):
             params=params,
         )
 
-    def search_for_available_plan_parent_dependencies(self, project_key, build_key, search_term, max_result=None, start_index=None):
+    def search_for_available_plan_parent_dependencies(
+        self, project_key, build_key, search_term, max_result=None, start_index=None
+    ):
         """Search for available plan parent dependencies
         :param project_key: projectKey path parameter
         :param build_key: buildKey path parameter
@@ -4159,8 +4159,6 @@ class Bamboo(AtlassianRestAPI):
             params=params,
         )
 
-
-
     """Job configuration"""
 
     def get_docker_pipeline_configuration(self, job_key):
@@ -4177,8 +4175,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.put(self.resource_url(f"job/{job_key}/docker"), data=data)
-
-
 
     """Global search"""
 
@@ -4305,7 +4301,15 @@ class Bamboo(AtlassianRestAPI):
             params["start-index"] = start_index
         return self.get(self.resource_url("search/users"), params=params)
 
-    def search_versions(self, deployment_project_id, max_result=None, branch_key=None, search_term=None, start_index=None, chronological_order=None):
+    def search_versions(
+        self,
+        deployment_project_id,
+        max_result=None,
+        branch_key=None,
+        search_term=None,
+        start_index=None,
+        chronological_order=None,
+    ):
         """Performs a contains search against a version name.
         :param max_result: max-result query parameter
         :param branch_key: branchKey query parameter
@@ -4330,8 +4334,6 @@ class Bamboo(AtlassianRestAPI):
             params["chronologicalOrder"] = chronological_order
         return self.get(self.resource_url("search/versions"), params=params)
 
-
-
     """Server status"""
 
     def get_status_2(self):
@@ -4339,8 +4341,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.get(self.resource_url("status"))
-
-
 
     """Utility"""
 
@@ -4350,8 +4350,6 @@ class Bamboo(AtlassianRestAPI):
         :return:
         """
         return self.post(self.resource_url("encrypt"), data=data)
-
-
 
     """Elastic configuration"""
 
@@ -4365,8 +4363,6 @@ class Bamboo(AtlassianRestAPI):
         if new_image_id is not None:
             params["newImageId"] = new_image_id
         return self.put(self.resource_url(f"elasticConfiguration/image-id/{image_id}"), params=params)
-
-
 
     """Quick filters"""
 
